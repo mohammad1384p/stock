@@ -5,9 +5,25 @@
 **۳۰۵ میلی‌ثانیه** (≈ ۳۳ درخواست) ادامه می‌دهد. پاسخ هر درخواست در ترمینال چاپ می‌شود.
 
 ## نصب
+
+روی دبیان/اوبونتو‌های جدید (پایتون ۳.۱۲ به بعد) نصب سراسری با `pip` خطای
+`error: externally managed environment` (PEP 668) می‌دهد؛ یک محیط مجازی بسازید:
+
 ```bash
-pip install -r requirements.txt
+sudo apt install -y python3-venv      # فقط اگر venv روی سیستم نصب نیست
+python3 -m venv .venv
+source .venv/bin/activate             # ویندوز:  .venv\Scripts\activate
+python -m pip install -r requirements.txt
 ```
+
+از این پس ربات را با پایتون همین محیط اجرا کنید: بعد از فعال‌سازی، `python exir_bot.py ...`
+کافی است و بدون فعال‌سازی باید `.venv/bin/python exir_bot.py ...` بنویسید.
+
+- اگر دانلود از PyPI کند است یا نیمه‌کاره می‌ماند، پرچم‌های مقاوم را اضافه کنید:
+  `python -m pip install --timeout 120 --retries 10 -r requirements.txt`
+  (با `-i <آدرسِ آینه>` هم می‌توانید از یک mirror داخلی استفاده کنید.)
+- راه دیگر بدون محیط مجازی: `pip install --break-system-packages -r requirements.txt`
+  که در صورت تداخل با پکیج‌های سیستمی توصیه نمی‌شود.
 
 ### هدرها و نشست ورود
 - هدرهای ثابت مرورگر (Accept، زبان، User-Agent، Origin، Referer و sec-*) روی نشست تنظیم می‌شوند؛ Referer هنگام ورود به صفحه‌ی login اشاره می‌کند و برای سفارش به market-view.
@@ -26,6 +42,11 @@ python exir_bot.py
 python exir_bot.py -s IRO7TONP0001 -q 10 -p 6700 -t 08:44:59.700
 python exir_bot.py -s وتوصا -q 10 -p 6700 -t 08:45:00 --app-n "2018887747744.29964494"
 ```
+
+> فایل اجرایی فقط همین `exir_bot.py` است (به همراه ماژول‌های `exir_auth.py`، `timesync.py` و
+> `captcha_web.py`). فایلی مثل `web_panel.py` در پروژه وجود ندارد و آرگومان‌های `--host` /
+> `--port` را `exir_bot.py` نمی‌شناسد؛ تنها وب‌سرور پروژه همان صفحه‌ی موقت کپچاست که با
+> `--captcha-web [PORT]` بالا می‌آید (پیش‌فرض `8765`).
 
 ## لاگین
 ```bash
