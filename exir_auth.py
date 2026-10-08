@@ -114,6 +114,13 @@ def save_token(path: Path, base: str, token: str, extra: dict | None = None) -> 
         pass
 
 
+def cookie_matches_host(domain: str, host: str) -> bool:
+    """Accept exact-host and parent-domain cookies, not lookalike domains."""
+    domain = domain.lstrip(".").lower()
+    host = host.lower()
+    return bool(domain) and (host == domain or host.endswith("." + domain))
+
+
 def session_cookies(session: requests.Session, base: str) -> list[dict]:
     """Keep broker cookies with their scope/expiry, never unrelated domains."""
     host = urlparse(base).hostname or ""
@@ -122,7 +129,7 @@ def session_cookies(session: requests.Session, base: str) -> list[dict]:
          "path": c.path, "secure": c.secure, "expires": c.expires,
          "rest": dict(c._rest)}
         for c in session.cookies
-        if c.domain.lstrip(".") == host and not c.is_expired()
+        if cookie_matches_host(c.domain, host) and not c.is_expired()
         and c.name != TOKEN_COOKIE
     ]
 
@@ -134,7 +141,7 @@ def restore_session_cookies(session: requests.Session, base: str, cookies) -> No
             cookie = requests.cookies.create_cookie(**item)
         except (TypeError, ValueError, AttributeError):
             continue
-        if cookie.domain.lstrip(".") != host or cookie.is_expired():
+        if not cookie_matches_host(cookie.domain, host) or cookie.is_expired():
             continue
         if cookie.name == TOKEN_COOKIE:
             continue
@@ -148,6 +155,12 @@ def restore_session_cookies(session: requests.Session, base: str, cookies) -> No
 def apply_token(session: requests.Session, base: str, token: str, mode: str) -> None:
     """قرار دادن توکن روی session: به‌صورت کوکی JWT-TOKEN و/یا هدر Authorization."""
     host = urlparse(base).hostname or ""
+    # A login or explicit Cookie header may leave another JWT at a parent
+    # domain/path. Sending two JWT-TOKEN values makes authentication ambiguous.
+    for cookie in list(session.cookies):
+        if cookie.name == TOKEN_COOKIE and cookie_matches_host(cookie.domain, host):
+            session.cookies.clear(cookie.domain, cookie.path, cookie.name)
+    session.headers.pop("Authorization", None)
     if mode in ("cookie", "both"):
         session.cookies.set(TOKEN_COOKIE, token, domain=host, path="/")
     if mode in ("bearer", "both"):
@@ -291,10 +304,11 @@ def security_hint(status: int, data) -> str:
         return ""
     return (
         "ℹ️  خطای ۹۰۰۹ یعنی درخواست از نظر امنیتی رد شده؛ علت دقیق از این کد مشخص نیست.\n"
-        "    توکن، کوکی‌های نشست، هدرها یا کپچا را بررسی کنید؛ با --login ورود تازه انجام دهید.\n"
-        "    اگر تصویر کپچا را در مرورگر خودتان مستقیماً از کارگزاری باز کرده‌اید، آن تصویر به\n"
-        "    نشستِ مرورگر شما گره خورده و برای لاگین از سرور معتبر نیست. تصویر باید با همان نشست\n"
-        "    سرور گرفته شود (پیش‌فرض همین است) و فقط کد آن به سرور برسد — با --captcha-web لینکش را بگیرید."
+        "    ورود موفق و نمایش نام حساب، معتبر بودن درخواست سفارش را تضمین نمی‌کند.\n"
+        "    کوکی‌های همراه نشست و هدر x-app-n را بین ورود و سفارش مقایسه کنید.\n"
+        "    برای گزارش بدون رمز/توکن و بدون ارسال سفارش: python diagnose_session.py\n"
+        "    در پنل از بخش ورود و در CLI با --login نشست تازه بگیرید. اگر خطا باقی ماند،\n"
+        "    مشخصات درخواست رسمی مرورگر را بدون مقادیر حساس برای مقایسه نگه دارید."
     )
 
 

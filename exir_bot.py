@@ -402,6 +402,7 @@ class Stats:
         self.sent = 0
         self.success = 0
         self.failed = 0
+        self.stop_reason: str | None = None
         self.results: list[tuple[int, str, int | None, str]] = []
 
 
@@ -417,13 +418,36 @@ def is_success(status: int, data) -> bool:
     return True
 
 
+def security_rejected(status: int, data) -> bool:
+    """Do not keep submitting unchanged orders after an auth/security rejection."""
+    if status == 401:
+        return True
+    if status != 403 or not isinstance(data, dict):
+        return False
+    return str(data.get("errorCode", "")) == "9009"
+
+
+def stop_message(stats: Stats, remaining: int) -> str:
+    with stats.lock:
+        reason = stats.stop_reason
+    if reason == "security":
+        detail = "⛔ ارسال به‌علت رد احراز هویت/امنیت کارگزاری متوقف شد"
+    elif reason == "success":
+        detail = "✅ پاسخ موفق سفارش دریافت شد"
+    else:
+        detail = "⏹ اجرا با درخواست کاربر متوقف شد"
+    return f"{detail}؛ {remaining} درخواست باقی‌مانده ارسال نشد."
+
+
 def send_order(idx: int, session: requests.Session, url: str, payload: bytes,
                timeout: float, tz, stats: Stats, stop_evt: threading.Event,
                stop_on_success: bool) -> None:
     sent_at = now_str(tz)
     t0 = time.perf_counter()
     try:
-        r = session.post(url, data=payload, timeout=timeout)
+        # Never follow an order redirect to a login HTML page and call it a
+        # successful order; also avoid replaying POST data to a redirect target.
+        r = session.post(url, data=payload, timeout=timeout, allow_redirects=False)
         ms = (time.perf_counter() - t0) * 1000
         try:
             data = r.json()
@@ -432,6 +456,9 @@ def send_order(idx: int, session: requests.Session, url: str, payload: bytes,
             data = None
             body = r.text[:2000] or "<empty>"
         ok = is_success(r.status_code, data)
+        if "text/html" in r.headers.get("content-type", "").lower():
+            ok = False
+        rejected = security_rejected(r.status_code, data)
         desc = ""
         if isinstance(data, dict):
             desc = str(data.get("description") or data.get("message") or data.get("type") or "")
@@ -439,6 +466,10 @@ def send_order(idx: int, session: requests.Session, url: str, payload: bytes,
             stats.success += ok
             stats.failed += (not ok)
             stats.results.append((idx, sent_at, r.status_code, desc))
+            if rejected or (ok and stop_on_success):
+                if stats.stop_reason is None:
+                    stats.stop_reason = "security" if rejected else "success"
+                stop_evt.set()
         head = f"#{idx:02d}  ارسال {sent_at}  ←  دریافت {now_str(tz)}  ({ms:.0f}ms)  HTTP {r.status_code}"
         extra = ""
         if not ok:
@@ -446,8 +477,6 @@ def send_order(idx: int, session: requests.Session, url: str, payload: bytes,
             if hint:
                 extra = "\n" + yellow(hint)
         log((green("✔ " + head) if ok else red("✘ " + head)) + "\n" + body + extra + "\n" + "─" * 60)
-        if ok and stop_on_success:
-            stop_evt.set()
     except Exception as e:  # noqa: BLE001
         ms = (time.perf_counter() - t0) * 1000
         with stats.lock:
@@ -727,11 +756,11 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=min(count, 64)) as pool:
             for k, ts in enumerate(schedule, 1):
                 if stop_evt.is_set():
-                    log(green(f"⏹  سفارش موفق دریافت شد؛ {count - k + 1} درخواست باقی‌مانده ارسال نشد."))
+                    log(stop_message(stats, count - k + 1))
                     break
                 wait_until(ts)
                 if stop_evt.is_set():
-                    log(green(f"⏹  سفارش موفق دریافت شد؛ {count - k + 1} درخواست باقی‌مانده ارسال نشد."))
+                    log(stop_message(stats, count - k + 1))
                     break
                 with stats.lock:
                     stats.sent += 1

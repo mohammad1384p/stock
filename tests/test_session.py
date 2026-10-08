@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import requests
 
-from exir_auth import session_cookies, restore_session_cookies, login
+from exir_auth import apply_token, session_cookies, restore_session_cookies, login
 from exir_bot import build_session, apply_replay
 
 BASE = 'https://broker.example'
@@ -38,6 +38,39 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(restored.cookies.get('cookiesession1'), 'explicit')
         restore_session_cookies(restored, BASE, [{'domain': 'other.example', 'name': 'bad', 'value': 'x'}])
         self.assertIsNone(restored.cookies.get('bad'))
+
+    def test_parent_domain_cookie_survives_and_is_sent(self):
+        base = "https://trade.broker.example"
+        session = requests.Session()
+        session.cookies.set("parent_session", "private", domain=".broker.example", secure=True)
+        session.cookies.set("lookalike", "private", domain="notbroker.example")
+        session.cookies.set("child", "private", domain="child.trade.broker.example")
+        restored = requests.Session()
+        cookies = session_cookies(session, base)
+        self.assertEqual([c["name"] for c in cookies], ["parent_session"])
+        restore_session_cookies(restored, base, cookies)
+        req = restored.prepare_request(requests.Request("POST", base + "/api/v1/order"))
+        self.assertEqual(req.headers["Cookie"], "parent_session=private")
+        restore_session_cookies(restored, base, [
+            {"name": "bad", "value": "x", "domain": "notbroker.example"}])
+        self.assertIsNone(restored.cookies.get("bad"))
+
+    def test_apply_token_removes_duplicate_jwts_for_broker(self):
+        base = "https://trade.broker.example"
+        session = requests.Session()
+        session.cookies.set("JWT-TOKEN", "old", domain=".broker.example", path="/")
+        session.cookies.set("JWT-TOKEN", "old2", domain="trade.broker.example", path="/api")
+        session.cookies.set("JWT-TOKEN", "unrelated", domain="other.example")
+        session.headers["Authorization"] = "Bearer stale"
+        apply_token(session, base, "current", "cookie")
+        req = session.prepare_request(requests.Request("POST", base + "/api/v1/order"))
+        self.assertEqual(req.headers["Cookie"], "JWT-TOKEN=current")
+        self.assertNotIn("Authorization", req.headers)
+        self.assertEqual(session.cookies.get("JWT-TOKEN", domain="other.example"), "unrelated")
+        apply_token(session, base, "bearer", "bearer")
+        req = session.prepare_request(requests.Request("POST", base + "/api/v1/order"))
+        self.assertNotIn("Cookie", req.headers)
+        self.assertEqual(req.headers["Authorization"], "Bearer bearer")
 
     def test_login_reuses_session_app_header(self):
         session = requests.Session()
