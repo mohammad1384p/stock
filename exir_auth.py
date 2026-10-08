@@ -251,7 +251,7 @@ def obtain_captcha(portal: CaptchaPortal | None, log) -> tuple[str | None, str]:
     return code, source
 
 
-def _security_hint(status: int, data) -> str:
+def security_hint(status: int, data) -> str:
     """توضیح خطای ۹۰۰۹ (مشکل امنیتی) برای کاربر."""
     if status != 403:
         return ""
@@ -268,9 +268,11 @@ def _security_hint(status: int, data) -> str:
 
 def login(session: requests.Session, base: str, username: str, password: str, *,
           captcha_url: str | None, otp: str | None, captcha_path: Path,
-          log, portal: CaptchaPortal | None = None, max_tries: int = 3) -> dict:
+          log, portal: CaptchaPortal | None = None, app_n: str | None = None,
+          max_tries: int = 3) -> dict:
     """لاگین تعاملی. خروجی: دیکشنری پاسخ سرور (شامل authToken)."""
     url = base + LOGIN_PATH
+    app_n = (app_n or "").strip() or f"NaN.{random.randint(10_000_000, 99_999_999)}"
     for attempt in range(1, max_tries + 1):
         while True:
             img = fetch_captcha(session, base, captcha_url, log)
@@ -297,7 +299,7 @@ def login(session: requests.Session, base: str, username: str, password: str, *,
             "accept": "application/json",
             "referer": f"{base}/new-exir/login",
             "clientid": "",
-            "x-app-n": f"NaN.{random.randint(10_000_000, 99_999_999)}",
+            "x-app-n": app_n,
         }
         r = session.post(url, json=body, headers=headers, timeout=15)
         try:
@@ -308,12 +310,13 @@ def login(session: requests.Session, base: str, username: str, password: str, *,
         token = (data.get("authToken") if isinstance(data, dict) else None) or session.cookies.get(TOKEN_COOKIE)
         if r.status_code == 200 and token:
             data["authToken"] = token
+            data["_appN"] = app_n  # تا سفارش‌ها هم با همان x-app-nِ لاگین بروند
             if portal is not None:
                 portal.finish(True, "✅ ورود موفق بود؛ می‌توانید این صفحه را ببندید.")
             return data
 
         log(f"✘ لاگین ناموفق (HTTP {r.status_code}):\n{json.dumps(_mask(data), ensure_ascii=False, indent=2)}")
-        hint = _security_hint(r.status_code, data)
+        hint = security_hint(r.status_code, data)
         if hint:
             log(_yellow(hint))
         if portal is not None:
@@ -334,6 +337,7 @@ def ensure_token(session: requests.Session, args, log, interactive: bool) -> str
     token_file = Path(args.token_file)
 
     token: str | None = None
+    app_n: str | None = (getattr(args, "app_n", None) or "").strip() or None
     if args.token and not args.login:
         token = clean_token(args.token)
         log(f"🔑 استفاده از توکن داده‌شده ({describe_token(token)})")
@@ -341,6 +345,8 @@ def ensure_token(session: requests.Session, args, log, interactive: bool) -> str
         saved = load_saved_token(token_file, base)
         if saved:
             token = saved["token"]
+            if not app_n and saved.get("appN"):
+                app_n = saved["appN"]  # همان x-app-nِ لاگین را برای سفارش‌ها هم بفرست
             log(f"🔑 استفاده از توکن ذخیره‌شده در {token_file} ({describe_token(token)})")
 
     if not token:
@@ -362,17 +368,22 @@ def ensure_token(session: requests.Session, args, log, interactive: bool) -> str
         try:
             data = login(session, base, username, password,
                          captcha_url=args.captcha_url, otp=args.otp,
-                         captcha_path=Path(args.captcha_file), log=log, portal=portal)
+                         captcha_path=Path(args.captcha_file), log=log, portal=portal,
+                         app_n=app_n)
         finally:
             if portal is not None:
                 portal.stop()
         token = data["authToken"]
+        app_n = data.get("_appN") or app_n
         name = f"{data.get('firstName', '')} {data.get('lastName', '')}".strip()
         log(f"✔ ورود موفق{(' — ' + name) if name else ''} ({describe_token(token)})")
         if data.get("sendOrderDelay"):
             log(f"ℹ️  sendOrderDelay کارگزار: {data['sendOrderDelay']}ms")
-        save_token(token_file, base, token, {"name": name, "sendOrderDelay": data.get("sendOrderDelay")})
+        save_token(token_file, base, token,
+                   {"name": name, "sendOrderDelay": data.get("sendOrderDelay"), "appN": app_n})
         log(f"💾 توکن در {token_file} ذخیره شد (دفعه‌ی بعد تا زمان انقضا نیازی به لاگین نیست).")
 
     apply_token(session, base, token, args.auth_mode)
+    if app_n and not getattr(args, "app_n", None):
+        session.headers["x-app-n"] = app_n  # ثبات x-app-n بین لاگین و سفارش‌ها
     return token
