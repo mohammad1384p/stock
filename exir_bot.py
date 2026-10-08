@@ -229,7 +229,7 @@ def build_session(args, pool: int) -> requests.Session:
     base = args.base_url.rstrip("/")
     s.headers.update({
         "accept": "application/json, text/plain, */*",
-        "accept-language": "en-US,en;q=0.9,fa;q=0.8",
+        "accept-language": "en-US,en;q=0.9,fa;q=0.8,nl;q=0.7,zh-CN;q=0.6,zh;q=0.4",
         "content-type": "application/json",
         "origin": base,
         "referer": f"{base}/new-exir/market-view",
@@ -333,9 +333,17 @@ def parse_fetch_snippet(text: str) -> dict:
     return out
 
 
-def apply_replay(session: requests.Session, headers: dict, log) -> None:
+def apply_replay(session: requests.Session, headers: dict, log, *, preserve_session: bool = False) -> None:
     """هدرهای خروجی Copy as fetch را روی session می‌گذارد (کوکی‌ها merge می‌شوند)."""
     for k, v in headers.items():
+        k = k.lower()
+        if preserve_session and k in {
+            "cookie", "authorization", "x-app-n", "user-agent",
+            "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+            "origin", "referer",
+        }:
+            log(f"ℹ️  هدر {k} از فایل اعمال نشد؛ نشست ورود فعلی حفظ شد.")
+            continue
         if k in _HOP_HEADERS:
             if k == "cookie":
                 host = requests.utils.urlparse(session.headers.get("origin", "")).hostname or ""
@@ -574,7 +582,7 @@ def main() -> None:
         snippet = parse_fetch_snippet(raw)   # JSON خالص یا خروجی «Copy as fetch»
         replay_text = snippet["body"]
         if snippet["headers"]:
-            apply_replay(session, snippet["headers"], log)
+            apply_replay(session, snippet["headers"], log, preserve_session=bool(token))
         if not replay_text:
             log(red("✘ در فایل بدنه‌ی سفارشی، JSON یا بدنه‌ی Copy as fetch پیدا نشد."))
             sys.exit(2)
