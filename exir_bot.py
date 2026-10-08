@@ -50,6 +50,8 @@ USER_AGENT = (
 )
 SYMBOLS_FILE = Path(__file__).with_name("symbols.json")
 ISIN_RE = re.compile(r"^IR[A-Z0-9]{10}$")
+# مقادیری که برای --clientid یعنی «این هدر را نفرست»
+OFF_VALUES = {"off", "none", "-", "خاموش", "بدون"}
 
 # --------------------------------------------------------------------------- #
 #  چاپ رنگی و thread-safe
@@ -220,6 +222,17 @@ def wait_until(ts: float) -> None:
 # --------------------------------------------------------------------------- #
 #  ساخت session و هدرها
 # --------------------------------------------------------------------------- #
+def clientid_value(args) -> str | None:
+    """مقدار هدر ``clientid`` — ``None`` یعنی این هدر فرستاده نشود."""
+    raw = getattr(args, "clientid", None)
+    if raw is None:
+        raw = os.environ.get("EXIR_CLIENTID")
+    if raw is None:
+        return ""  # مثل درخواست ورودِ مرورگر: هدر هست، مقدارش خالی است
+    value = str(raw).strip()
+    return None if value.lower() in OFF_VALUES else value
+
+
 def build_session(args, pool: int) -> requests.Session:
     s = requests.Session()
     adapter = HTTPAdapter(pool_connections=4, pool_maxsize=max(pool, 10))
@@ -251,6 +264,13 @@ def build_session(args, pool: int) -> requests.Session:
                 s.cookies.set(k.strip(), v.strip(), domain=host, path="/")
     if args.app_n:
         s.headers["x-app-n"] = args.app_n.strip()
+    # هدر clientid در درخواست ورودِ مرورگر وجود دارد؛ برای سفارش‌ها هم همان مقدار
+    # (پیش‌فرض: خالی) فرستاده می‌شود تا نشست بین «ورود» و «سفارش» یکدست بماند.
+    clientid = clientid_value(args)
+    if clientid is None:
+        s.headers.pop("clientid", None)
+    else:
+        s.headers["clientid"] = clientid
     for h in args.header or []:
         if ":" not in h:
             log(yellow(f"⚠️  هدر نامعتبر نادیده گرفته شد: {h}"))
@@ -338,7 +358,7 @@ def apply_replay(session: requests.Session, headers: dict, log, *, preserve_sess
     for k, v in headers.items():
         k = k.lower()
         if preserve_session and k in {
-            "cookie", "authorization", "x-app-n", "user-agent",
+            "cookie", "authorization", "x-app-n", "clientid", "user-agent",
             "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
             "origin", "referer",
         }:
@@ -375,6 +395,79 @@ def order_hint(status: int, data) -> str:
     )
 
 
+def _short(value: str, head: int = 12) -> str:
+    value = str(value)
+    return value if len(value) <= head else f"{value[:head]}…({len(value)} کاراکتر)"
+
+
+def _mask_cookie(value: str) -> str:
+    """``Cookie`` را به فهرست «نام + مقدار کوتاه‌شده» تبدیل می‌کند."""
+    out = []
+    for part in value.split(";"):
+        if "=" in part:
+            name, val = part.split("=", 1)
+            out.append(f"{name.strip()}={_short(val.strip(), 8)}")
+        elif part.strip():
+            out.append(part.strip())
+    return "; ".join(out)
+
+
+def format_request(request, *, mask: bool = True) -> str:
+    """
+    درخواستی که واقعاً فرستاده شده را به شکل DevTools (خط اول + هدرها + بدنه) برمی‌گرداند.
+
+    با ``mask=True`` مقدار کوکی/توکن کوتاه می‌شود تا لاگ قابل اشتراک‌گذاری باشد.
+    """
+    if request is None:
+        return "<درخواست ثبت نشد>"
+    headers = {k: v for k, v in (getattr(request, "headers", None) or {}).items()}
+    if not any(k.lower() == "host" for k in headers):
+        host = requests.utils.urlparse(getattr(request, "url", "") or "").netloc
+        if host:
+            headers = {"Host": host, **headers}
+    body = getattr(request, "body", None)
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    lines = [f"{getattr(request, 'method', 'POST')} {requests.utils.urlparse(getattr(request, 'url', '')).path} HTTP/1.1"]
+    for name, value in headers.items():
+        low = name.lower()
+        if mask and low == "cookie":
+            value = _mask_cookie(value)
+        elif mask and low == "authorization":
+            value = _short(value)
+        lines.append(f"{name}: {value}")
+    if body:
+        lines.append("")
+        lines.append(str(body))
+    return "\n".join(lines)
+
+
+def preview_request(session: requests.Session, method: str, url: str, payload=None,
+                    *, mask: bool = True) -> str:
+    """درخواستی را که *فرستاده می‌شود* بدون ارسال می‌سازد و قالب‌بندی می‌کند (برای dry-run)."""
+    try:
+        prepared = session.prepare_request(requests.Request(method, url, data=payload))
+    except Exception as e:  # noqa: BLE001
+        return f"<ساخت پیش‌نمایش درخواست ناموفق بود: {e}>"
+    return format_request(prepared, mask=mask)
+
+
+def identity_notes(session: requests.Session) -> list[str]:
+    """هشدارهای مربوط به هدرهای شناسایی (x-app-n / clientid) برای لاگ."""
+    notes = []
+    app_n = session.headers.get("x-app-n")
+    if app_n is None:
+        notes.append("⚠️  هدر x-app-n فرستاده نمی‌شود؛ اگر ۹۰۰۹ گرفتید مقدار مرورگر را با "
+                     "--app-n یا -H 'x-app-n: …' بدهید.")
+    elif re.fullmatch(r"NaN\.[0-9]+", str(app_n).strip()):
+        notes.append("⚠️  x-app-n الگوی جایگزین «NaN.<عدد>» است؛ نمونه‌ی مرورگر شکل "
+                     "<۱۳ رقم>.<۸ رقم> دارد. اگر ۴۰۳/۹۰۰۹ گرفتید مقدار مرورگر را با --app-n بدهید "
+                     "یا با «python probe_order.py --app-n-candidate <مقدار> --yes» امتحان کنید.")
+    notes.append(f"ℹ️  هدرهای شناسایی: clientid={session.headers.get('clientid', '«فرستاده نمی‌شود»')!r}"
+                 f"  x-app-n={app_n if app_n is not None else '«فرستاده نمی‌شود»'!r}")
+    return notes
+
+
 def warmup(session: requests.Session, base: str, tz) -> None:
     """برقراری اتصال TLS قبل از زمان هدف + نمایش اختلاف ساعت با سرور."""
     try:
@@ -404,6 +497,8 @@ class Stats:
         self.failed = 0
         self.stop_reason: str | None = None
         self.results: list[tuple[int, str, int | None, str]] = []
+        # فقط یک‌بار در هر اجرا، درخواستِ ردشده را کامل چاپ می‌کنیم (نه ۳۲ بار)
+        self.request_dumped = False
 
 
 def is_success(status: int, data) -> bool:
@@ -462,10 +557,15 @@ def send_order(idx: int, session: requests.Session, url: str, payload: bytes,
         desc = ""
         if isinstance(data, dict):
             desc = str(data.get("description") or data.get("message") or data.get("type") or "")
+        show_request = False
         with stats.lock:
             stats.success += ok
             stats.failed += (not ok)
             stats.results.append((idx, sent_at, r.status_code, desc))
+            if not ok and not stats.request_dumped:
+                # عیب‌یابی: عینِ درخواستی که رفت، یک‌بار چاپ می‌شود (مقادیر حساس کوتاه‌شده)
+                stats.request_dumped = True
+                show_request = True
             if rejected or (ok and stop_on_success):
                 if stats.stop_reason is None:
                     stats.stop_reason = "security" if rejected else "success"
@@ -476,6 +576,10 @@ def send_order(idx: int, session: requests.Session, url: str, payload: bytes,
             hint = order_hint(r.status_code, data if data is not None else body)
             if hint:
                 extra = "\n" + yellow(hint)
+            if show_request:
+                extra += ("\n" + cyan("📤 درخواستی که فرستاده شد (مقدار کوکی/توکن کوتاه شده) — این را با "
+                                      "درخواست مرورگر در DevTools مقایسه کنید:") + "\n"
+                          + format_request(getattr(r, "request", None), mask=True))
         log((green("✔ " + head) if ok else red("✘ " + head)) + "\n" + body + extra + "\n" + "─" * 60)
     except Exception as e:  # noqa: BLE001
         ms = (time.perf_counter() - t0) * 1000
@@ -538,6 +642,9 @@ def parse_args() -> argparse.Namespace:
                    help="کوکی‌های اضافه به شکل 'a=1; b=2' (اختیاری، یا EXIR_COOKIE)")
     g.add_argument("--app-n", default=os.environ.get("EXIR_APP_N"),
                    help="مقدار هدر x-app-n (اختیاری، یا EXIR_APP_N)")
+    g.add_argument("--clientid", default=os.environ.get("EXIR_CLIENTID"),
+                   help="مقدار هدر clientid (پیش‌فرض: مثل درخواست ورودِ مرورگر، خالی). "
+                        "«off» بدهید تا این هدر اصلاً فرستاده نشود (یا EXIR_CLIENTID)")
     p.add_argument("-H", "--header", action="append",
                    help="هدر اضافه به شکل 'name: value' (قابل تکرار)")
     p.add_argument("--base-url", default=os.environ.get("EXIR_BASE_URL", DEFAULT_BASE_URL),
@@ -708,14 +815,11 @@ def main() -> None:
     if delay and args.interval < int(delay):
         log(yellow(f"  ⚠️  کارگزار sendOrderDelay={delay}ms اعلام کرده؛ فاصله‌ی {args.interval}ms ممکن است خطای محدودیت بگیرد."))
     log(f"  بدنه       : {json.dumps(body, ensure_ascii=False)}")
+    for note in identity_notes(session):
+        log(yellow("  " + note) if note.startswith("⚠️") else "  " + note)
     if args.dry_run:
-        log(yellow("\n[dry-run] هیچ درخواستی ارسال نشد.\nهدرها:"))
-        for k, v in session.headers.items():
-            if k.lower() == "authorization":
-                v = v[:16] + "…"
-            log(f"  {k}: {v}")
-        for c in session.cookies:
-            log(f"  cookie {c.name}={c.value[:10]}…")
+        log(yellow("\n[dry-run] هیچ درخواستی ارسال نشد. درخواستی که فرستاده می‌شد:"))
+        log(preview_request(session, "POST", url, payload))
         return
 
     if interactive and not args.yes:

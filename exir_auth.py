@@ -295,6 +295,19 @@ def obtain_captcha(portal: CaptchaPortal | None, log) -> tuple[str | None, str]:
     return code, source
 
 
+def generate_app_n() -> str:
+    """
+    یک مقدار تولیدی برای هدر ``x-app-n`` با همان *شکلِ* دیده‌شده در مرورگر::
+
+        <۱۳ رقم>.<۸ رقم>        مثل: 2018887747744.29964494
+
+    این مقدار از مرورگر نیامده است؛ فقط شکلش مثل نمونه‌ی رسمی است (نسخه‌های قبلی
+    ``NaN.<عدد>`` می‌ساختند که هیچ‌وقت در درخواست مرورگر دیده نشده). اگر مقدار واقعیِ
+    مرورگر را دارید، آن را با ``--app-n`` بدهید.
+    """
+    return f"{random.randint(10 ** 12, 10 ** 13 - 1)}.{random.randint(10 ** 7, 10 ** 8 - 1)}"
+
+
 def security_hint(status: int, data) -> str:
     """توضیح خطای ۹۰۰۹ (مشکل امنیتی) برای کاربر."""
     if status != 403:
@@ -306,9 +319,11 @@ def security_hint(status: int, data) -> str:
         "ℹ️  خطای ۹۰۰۹ یعنی درخواست از نظر امنیتی رد شده؛ علت دقیق از این کد مشخص نیست.\n"
         "    ورود موفق و نمایش نام حساب، معتبر بودن درخواست سفارش را تضمین نمی‌کند.\n"
         "    کوکی‌های همراه نشست و هدر x-app-n را بین ورود و سفارش مقایسه کنید.\n"
-        "    برای گزارش بدون رمز/توکن و بدون ارسال سفارش: python diagnose_session.py\n"
-        "    در پنل از بخش ورود و در CLI با --login نشست تازه بگیرید. اگر خطا باقی ماند،\n"
-        "    مشخصات درخواست رسمی مرورگر را بدون مقادیر حساس برای مقایسه نگه دارید."
+        "    «درخواستی که فرستاده شد» در همین لاگ (با مقادیر حساس کوتاه‌شده) چاپ شده است؛\n"
+        "    آن را با درخواست مرورگر در DevTools (Network ← Copy → Copy as fetch) مقایسه کنید.\n"
+        "    برای پیدا کردن علت با حذف فرضیه‌ها (هیچ سفارش واقعی ثبت نمی‌شود):\n"
+        "        python probe_order.py --yes\n"
+        "    و برای گزارش بدون رمز/توکن و بدون ارسال درخواست: python diagnose_session.py"
     )
 
 
@@ -318,7 +333,11 @@ def login(session: requests.Session, base: str, username: str, password: str, *,
           max_tries: int = 3) -> dict:
     """لاگین تعاملی. خروجی: دیکشنری پاسخ سرور (شامل authToken)."""
     url = base + LOGIN_PATH
-    app_n = (app_n or session.headers.get("x-app-n") or "").strip() or f"NaN.{random.randint(10_000_000, 99_999_999)}"
+    app_n = (app_n or session.headers.get("x-app-n") or "").strip()
+    if not app_n:
+        app_n = generate_app_n()
+        log(f"🧩 هدر x-app-n تنظیم نشده بود؛ مقدار تولیدی با شکل نمونه‌ی مرورگر ساخته شد: {app_n}\n"
+            "    (اگر مقدار واقعی مرورگر را دارید با --app-n بدهید — همان برای ورود و سفارش‌ها می‌رود.)")
     session.headers["x-app-n"] = app_n
     for attempt in range(1, max_tries + 1):
         while True:
@@ -345,7 +364,9 @@ def login(session: requests.Session, base: str, username: str, password: str, *,
         headers = {
             "accept": "application/json, text/plain, */*",
             "referer": f"{base}/new-exir/login",
-            "clientid": "",
+            # همان clientidی که روی نشست تنظیم شده (پیش‌فرض: خالی، مثل درخواست مرورگر)؛
+            # اگر --clientid مقدار داشته باشد، همان برای ورود و سفارش‌ها فرستاده می‌شود.
+            "clientid": session.headers.get("clientid", ""),
             "x-app-n": app_n,
         }
         r = session.post(url, json=body, headers=headers, timeout=15)

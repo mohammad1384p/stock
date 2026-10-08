@@ -422,6 +422,7 @@ def _base_cfg(state: PanelState) -> SimpleNamespace:
         base_url=state.base,
         cookie=getattr(args, "cookie", None),
         app_n=getattr(args, "app_n", None),
+        clientid=getattr(args, "clientid", None),
         header=list(getattr(args, "header", None) or []),
         auth_mode=getattr(args, "auth_mode", "cookie"),
         token=getattr(args, "token", None),
@@ -557,13 +558,13 @@ def _fire(state: PanelState, cfg: SimpleNamespace, session, base: str, stop_evt:
     if exp and exp < start_ts + cfg.duration and not cfg.dry_run:
         panel_log("⚠️  توکن قبل از پایان زمان ارسال منقضی می‌شود؛ تازه لاگین کنید.")
     panel_log(f"  بدنه       : {json.dumps(body, ensure_ascii=False)}")
+    for note in exir_bot.identity_notes(session):
+        panel_log("  " + note)
 
     if cfg.dry_run:
-        panel_log("[dry-run] هیچ درخواستی ارسال نمی‌شود. هدرها:")
-        for key, value in session.headers.items():
-            if key.lower() == "authorization":
-                value = value[:16] + "…"
-            panel_log(f"  {key}: {value}")
+        panel_log("[dry-run] هیچ درخواستی ارسال نمی‌شود. درخواستی که فرستاده می‌شد:")
+        for block_line in exir_bot.preview_request(session, "POST", url, payload).splitlines():
+            panel_log("  " + block_line)
         state.set_status("dry-run", "اجرای آزمایشی تمام شد؛ درخواستی ارسال نشد.")
         return
 
@@ -623,7 +624,10 @@ def _fire(state: PanelState, cfg: SimpleNamespace, session, base: str, stop_evt:
     panel_log(f"📊 گزارش نهایی — ارسال‌شده: {sent} | موفق: {ok} | ناموفق: {failed}")
     if stats.stop_reason == "security":
         state.set_status("error", "کارگزاری درخواست را از نظر احراز هویت/امنیت رد کرد؛ "
-                         "ارسال‌های بعدی متوقف شدند. نشست و هدرهای سفارش را بررسی کنید.")
+                         "ارسال‌های بعدی متوقف شدند. برای پیدا کردن علت (بدون ثبت سفارش واقعی): "
+                         "python probe_order.py --yes")
+        panel_log("ℹ️  برای پیدا کردن علت ۹۰۰۹ با حذف فرضیه‌ها (هیچ سفارش واقعی ثبت نمی‌شود): "
+                  "python probe_order.py --yes")
     elif stop_evt.is_set() and ok:
         state.set_status("finished", f"سفارش موفق ثبت شد ({ok} پاسخ موفق از {sent} درخواست).")
     elif stop_evt.is_set():
@@ -1416,6 +1420,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="کوکی‌های نشست مرورگر: 'a=1; b=2'")
     g.add_argument("--app-n", default=os.environ.get("EXIR_APP_N"),
                    help="مقدار هدر x-app-n (برای ورود و سفارش یکسان می‌شود)")
+    g.add_argument("--clientid", default=os.environ.get("EXIR_CLIENTID"),
+                   help="مقدار هدر clientid (پیش‌فرض: خالی، مثل درخواست ورود مرورگر؛ «off» = نفرست)")
     g.add_argument("-H", "--header", action="append", default=[],
                    help="هدر دلخواه 'Name: value' (چند بار مجاز)")
     g.add_argument("--auth-mode", choices=["cookie", "bearer", "both"], default="cookie",
