@@ -195,31 +195,6 @@ def show_captcha(img: bytes, path: Path, log) -> None:
     path.write_bytes(img)
     log(f"🖼  تصویر کپچا ذخیره شد: {path.resolve()}")
 
-    # نمایش داخل ترمینال (در صورت نصب بودن Pillow)
-    if ext != ".svg":
-        try:
-            from io import BytesIO
-            from PIL import Image  # type: ignore
-
-            im = Image.open(BytesIO(img)).convert("RGB")
-            width = min(80, shutil.get_terminal_size((80, 24)).columns - 2)
-            h = max(2, int(im.height * width / im.width))
-            h += h % 2
-            im = im.resize((width, h))
-            px = im.load()
-            out = []
-            for y in range(0, h, 2):
-                row = []
-                for x in range(width):
-                    r1, g1, b1 = px[x, y]
-                    r2, g2, b2 = px[x, y + 1]
-                    row.append(f"\033[38;2;{r1};{g1};{b1}m\033[48;2;{r2};{g2};{b2}m▀")
-                out.append("".join(row) + "\033[0m")
-            print("\n".join(out), flush=True)
-            return
-        except Exception:  # noqa: BLE001
-            pass
-
     # باز کردن با نمایشگر سیستم
     for cmd in (["termux-open", str(path)], ["xdg-open", str(path)], ["open", str(path)]):
         if shutil.which(cmd[0]):
