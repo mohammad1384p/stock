@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ربات ارسال سفارش زمان‌دار برای سامانه‌ی معاملاتی Exir (اکسیر).
+
+در زمان مشخص‌شده (ساعت:دقیقه:ثانیه) شروع به ارسال درخواست ثبت سفارش می‌کند و
+به مدت N ثانیه (پیش‌فرض ۱۰) با فاصله‌ی M میلی‌ثانیه (پیش‌فرض ۳۰۵) تکرار می‌کند.
+پاسخ هر درخواست در ترمینال چاپ می‌شود.
+
+نمونه:
+    python exir_bot.py -s IRO7TONP0001 -q 10 -p 6700 -t 08:44:59.500
+    python exir_bot.py               # همه‌چیز به‌صورت تعاملی پرسیده می‌شود
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import re
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+except ImportError:  # pragma: no cover
+    print("کتابخانه‌ی requests نصب نیست. اجرا کنید:  pip install -r requirements.txt")
+    sys.exit(1)
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
+
+DEFAULT_BASE_URL = "https://khobregan.exirbroker.com"
+ORDER_PATH = "/api/v1/order"
+USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36"
+)
+SYMBOLS_FILE = Path(__file__).with_name("symbols.json")
+ISIN_RE = re.compile(r"^IR[A-Z0-9]{10}$")
+
+# --------------------------------------------------------------------------- #
+#  چاپ رنگی و thread-safe
+# --------------------------------------------------------------------------- #
+_print_lock = threading.Lock()
+_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def _c(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if _COLOR else s
+
+
+def green(s): return _c("32", s)
+def red(s): return _c("31", s)
+def yellow(s): return _c("33", s)
+def cyan(s): return _c("36", s)
+def bold(s): return _c("1", s)
+
+
+def log(*args) -> None:
+    with _print_lock:
+        print(*args, flush=True)
+
+
+def now_str(tz) -> str:
+    return datetime.now(tz).strftime("%H:%M:%S.%f")[:-3]
+
+
+# --------------------------------------------------------------------------- #
+#  پیدا کردن کد ISIN (insMaxLcode) از روی نماد / نام / تگ
+# --------------------------------------------------------------------------- #
+def normalize_fa(s: str) -> str:
+    """یکسان‌سازی حروف فارسی/عربی و حذف فاصله‌های اضافی."""
+    s = s.strip()
+    for a, b in (("ي", "ی"), ("ك", "ک"), ("ى", "ی"), ("\u200c", " "), ("ة", "ه")):
+        s = s.replace(a, b)
+    return re.sub(r"\s+", " ", s)
+
+
+def load_local_symbols() -> dict[str, str]:
+    """symbols.json: {"وتوصا": "IRO7TONP0001", ...}"""
+    if not SYMBOLS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(SYMBOLS_FILE.read_text(encoding="utf-8"))
+        return {normalize_fa(k): v.strip().upper() for k, v in data.items()}
+    except Exception as e:  # noqa: BLE001
+        log(yellow(f"⚠️  خواندن symbols.json ناموفق بود: {e}"))
+        return {}
+
+
+def save_local_symbol(symbol: str, isin: str) -> None:
+    try:
+        data = {}
+        if SYMBOLS_FILE.exists():
+            data = json.loads(SYMBOLS_FILE.read_text(encoding="utf-8"))
+        data[normalize_fa(symbol)] = isin
+        SYMBOLS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def tsetmc_lookup(query: str, interactive: bool) -> str | None:
+    """جستجوی نماد در TSETMC و برگرداندن ISIN."""
+    q = normalize_fa(query)
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    url = f"https://cdn.tsetmc.com/api/Instrument/GetInstrumentSearch/{requests.utils.quote(q)}"
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        items = r.json().get("instrumentSearch") or []
+    except Exception as e:  # noqa: BLE001
+        log(yellow(f"⚠️  جستجو در TSETMC ناموفق بود: {e}"))
+        return None
+
+    if not items:
+        return None
+
+    exact = [it for it in items if normalize_fa(str(it.get("lVal18AFC", ""))) == q]
+    candidates = exact or items
+    # نمادهای حذف‌شده/قدیمی را در انتها قرار بده
+    candidates.sort(key=lambda it: (int(bool(it.get("lastDate"))), 0 if it.get("flow") else 1))
+
+    chosen = candidates[0]
+    if len(candidates) > 1 and interactive and not exact:
+        log(cyan("چند نتیجه پیدا شد:"))
+        for i, it in enumerate(candidates[:10], 1):
+            log(f"  {i}) {it.get('lVal18AFC')} - {it.get('lVal30')}")
+        sel = input("شماره‌ی مورد نظر [1]: ").strip() or "1"
+        try:
+            chosen = candidates[int(sel) - 1]
+        except (ValueError, IndexError):
+            log(red("انتخاب نامعتبر."))
+            return None
+
+    isin = chosen.get("instrumentID")
+    if not isin:
+        ins_code = chosen.get("insCode")
+        try:
+            r = requests.get(
+                f"https://cdn.tsetmc.com/api/Instrument/GetInstrumentInfo/{ins_code}",
+                headers=headers, timeout=10,
+            )
+            r.raise_for_status()
+            isin = (r.json().get("instrumentInfo") or {}).get("instrumentID")
+        except Exception as e:  # noqa: BLE001
+            log(yellow(f"⚠️  گرفتن اطلاعات نماد از TSETMC ناموفق بود: {e}"))
+            return None
+    if isin:
+        log(green(f"✔ نماد «{chosen.get('lVal18AFC')}» ({chosen.get('lVal30')}) → {isin}"))
+    return isin
+
+
+def resolve_isin(query: str, interactive: bool) -> str:
+    raw = query.strip()
+    if ISIN_RE.match(raw.upper()):
+        return raw.upper()
+
+    local = load_local_symbols()
+    key = normalize_fa(raw)
+    if key in local:
+        log(green(f"✔ «{raw}» از symbols.json → {local[key]}"))
+        return local[key]
+
+    log(cyan(f"… جستجوی «{raw}» در TSETMC"))
+    isin = tsetmc_lookup(raw, interactive)
+    if isin:
+        save_local_symbol(raw, isin)
+        return isin
+
+    if interactive:
+        isin = input("نماد پیدا نشد. کد ISIN (مثل IRO7TONP0001) را وارد کنید: ").strip().upper()
+        if ISIN_RE.match(isin):
+            save_local_symbol(raw, isin)
+            return isin
+    log(red("✘ کد ISIN نماد پیدا نشد. مستقیماً کد ISIN را با -s بدهید یا آن را در symbols.json اضافه کنید."))
+    sys.exit(2)
+
+
+# --------------------------------------------------------------------------- #
+#  زمان
+# --------------------------------------------------------------------------- #
+def parse_target_time(s: str, tz, allow_tomorrow: bool) -> datetime:
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:[.,](\d{1,3}))?)?\s*", s)
+    if not m:
+        raise ValueError("فرمت زمان باید HH:MM:SS یا HH:MM:SS.mmm باشد")
+    h, mi = int(m.group(1)), int(m.group(2))
+    sec = int(m.group(3) or 0)
+    ms = int((m.group(4) or "0").ljust(3, "0"))
+    now = datetime.now(tz)
+    target = now.replace(hour=h, minute=mi, second=sec, microsecond=ms * 1000)
+    if target < now and allow_tomorrow:
+        target += timedelta(days=1)
+    return target
+
+
+def wait_until(ts: float) -> None:
+    """صبر دقیق تا زمان epoch مشخص (sleep درشت + busy-wait در انتها)."""
+    while True:
+        remaining = ts - time.time()
+        if remaining <= 0:
+            return
+        if remaining > 0.05:
+            time.sleep(min(remaining - 0.03, 0.5))
+        # کمتر از ۵۰ میلی‌ثانیه: busy-wait برای دقت بالا
+
+
+# --------------------------------------------------------------------------- #
+#  ساخت session و هدرها
+# --------------------------------------------------------------------------- #
+def build_session(args, pool: int) -> requests.Session:
+    s = requests.Session()
+    adapter = HTTPAdapter(pool_connections=4, pool_maxsize=max(pool, 10))
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+
+    base = args.base_url.rstrip("/")
+    s.headers.update({
+        "accept": "application/json, text/plain, */*",
+        "content-type": "application/json",
+        "origin": base,
+        "referer": f"{base}/new-exir/market-view",
+        "user-agent": USER_AGENT,
+        "sec-ch-ua": '"Chromium";v="154", "Google Chrome";v="154", "Not A(Brand";v="99"',
+        "sec-ch-ua-mobile": "?1",
+        "sec-ch-ua-platform": '"Android"',
+    })
+    if args.token:
+        tok = args.token.strip()
+        if args.auth_header.lower() == "authorization" and not tok.lower().startswith(("bearer ", "basic ")):
+            tok = f"Bearer {tok}"
+        s.headers[args.auth_header] = tok
+    if args.cookie:
+        s.headers["cookie"] = args.cookie.strip()
+    if args.app_n:
+        s.headers["x-app-n"] = args.app_n.strip()
+    for h in args.header or []:
+        if ":" not in h:
+            log(yellow(f"⚠️  هدر نامعتبر نادیده گرفته شد: {h}"))
+            continue
+        k, v = h.split(":", 1)
+        s.headers[k.strip()] = v.strip()
+    return s
+
+
+def build_body(args, isin: str) -> dict:
+    return {
+        "insMaxLcode": isin,
+        "bankAccountId": -1,
+        "side": "SIDE_SELL" if args.side == "sell" else "SIDE_BUY",
+        "orderType": "ORDER_TYPE_LIMIT",
+        "quantity": int(args.quantity),
+        "price": int(args.price),
+        "validityType": "VALIDITY_TYPE_DAY",
+        "validityDate": "",
+        "coreType": "c",
+        "hasUnderCautionAgreement": True,
+        "dividedOrder": False,
+        "etfTypeCode": None,
+    }
+
+
+def warmup(session: requests.Session, base: str, tz) -> None:
+    """برقراری اتصال TLS قبل از زمان هدف + نمایش اختلاف ساعت با سرور."""
+    try:
+        t0 = time.time()
+        r = session.get(base + "/", timeout=3, allow_redirects=False)
+        t1 = time.time()
+        rtt = (t1 - t0) * 1000
+        msg = f"🔌 اتصال آماده شد (HTTP {r.status_code}, RTT ≈ {rtt:.0f}ms)"
+        date_h = r.headers.get("Date")
+        if date_h:
+            server = parsedate_to_datetime(date_h).timestamp()
+            offset = server - (t0 + t1) / 2  # دقت حدود ±۱ ثانیه (هدر Date ثانیه‌ای است)
+            msg += f" | اختلاف تقریبی ساعت سرور با سیستم: {offset:+.1f}s"
+        log(cyan(msg))
+    except Exception as e:  # noqa: BLE001
+        log(yellow(f"⚠️  warm-up ناموفق بود (مشکلی نیست، ادامه می‌دهیم): {e}"))
+
+
+# --------------------------------------------------------------------------- #
+#  ارسال سفارش
+# --------------------------------------------------------------------------- #
+class Stats:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.sent = 0
+        self.success = 0
+        self.failed = 0
+        self.results: list[tuple[int, str, int | None, str]] = []
+
+
+def is_success(status: int, data) -> bool:
+    if not (200 <= status < 300):
+        return False
+    if isinstance(data, dict):
+        t = str(data.get("type", "")).lower()
+        if t == "error" or data.get("error") or data.get("errors"):
+            return False
+        if t:
+            return "success" in t
+    return True
+
+
+def send_order(idx: int, session: requests.Session, url: str, payload: bytes,
+               timeout: float, tz, stats: Stats, stop_evt: threading.Event,
+               stop_on_success: bool) -> None:
+    sent_at = now_str(tz)
+    t0 = time.perf_counter()
+    try:
+        r = session.post(url, data=payload, timeout=timeout)
+        ms = (time.perf_counter() - t0) * 1000
+        try:
+            data = r.json()
+            body = json.dumps(data, ensure_ascii=False, indent=2)
+        except ValueError:
+            data = None
+            body = r.text[:2000] or "<empty>"
+        ok = is_success(r.status_code, data)
+        desc = ""
+        if isinstance(data, dict):
+            desc = str(data.get("description") or data.get("message") or data.get("type") or "")
+        with stats.lock:
+            stats.success += ok
+            stats.failed += (not ok)
+            stats.results.append((idx, sent_at, r.status_code, desc))
+        head = f"#{idx:02d}  ارسال {sent_at}  ←  دریافت {now_str(tz)}  ({ms:.0f}ms)  HTTP {r.status_code}"
+        log((green("✔ " + head) if ok else red("✘ " + head)) + "\n" + body + "\n" + "─" * 60)
+        if ok and stop_on_success:
+            stop_evt.set()
+    except Exception as e:  # noqa: BLE001
+        ms = (time.perf_counter() - t0) * 1000
+        with stats.lock:
+            stats.failed += 1
+            stats.results.append((idx, sent_at, None, str(e)))
+        log(red(f"✘ #{idx:02d}  ارسال {sent_at}  ({ms:.0f}ms)  خطای شبکه: {e}") + "\n" + "─" * 60)
+
+
+# --------------------------------------------------------------------------- #
+#  ورودی‌ها
+# --------------------------------------------------------------------------- #
+def ask(prompt: str, default: str | None = None) -> str:
+    suffix = f" [{default}]" if default else ""
+    while True:
+        v = input(f"{prompt}{suffix}: ").strip()
+        if v:
+            return v
+        if default is not None:
+            return default
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="ربات ارسال سفارش زمان‌دار برای Exir (هر آرگومانی که ندهید، تعاملی پرسیده می‌شود)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("-s", "--symbol", help="نماد / نام / تگ سهم یا کد ISIN (مثل IRO7TONP0001 یا وتوصا)")
+    p.add_argument("-q", "--quantity", type=int, help="تعداد سهم")
+    p.add_argument("-p", "--price", type=int, help="قیمت هر سهم (ریال)")
+    p.add_argument("-t", "--time", help="زمان شروع HH:MM:SS یا HH:MM:SS.mmm")
+    p.add_argument("--side", choices=["buy", "sell"], default="buy", help="خرید یا فروش")
+    p.add_argument("-d", "--duration", type=float, default=10.0, help="مدت ارسال (ثانیه)")
+    p.add_argument("-i", "--interval", type=int, default=305, help="فاصله‌ی بین درخواست‌ها (میلی‌ثانیه)")
+    p.add_argument("--token", default=os.environ.get("EXIR_TOKEN"),
+                   help="توکن لاگین (یا متغیر محیطی EXIR_TOKEN). اگر ندهید پرسیده می‌شود")
+    p.add_argument("--auth-header", default=os.environ.get("EXIR_AUTH_HEADER", "Authorization"),
+                   help="نام هدری که توکن در آن قرار می‌گیرد")
+    p.add_argument("--cookie", default=os.environ.get("EXIR_COOKIE"),
+                   help="مقدار کامل هدر cookie (اختیاری، یا EXIR_COOKIE)")
+    p.add_argument("--app-n", default=os.environ.get("EXIR_APP_N"),
+                   help="مقدار هدر x-app-n (اختیاری، یا EXIR_APP_N)")
+    p.add_argument("-H", "--header", action="append",
+                   help="هدر اضافه به شکل 'name: value' (قابل تکرار)")
+    p.add_argument("--base-url", default=os.environ.get("EXIR_BASE_URL", DEFAULT_BASE_URL),
+                   help="آدرس کارگزاری")
+    p.add_argument("--tz", default=os.environ.get("EXIR_TZ", "Asia/Tehran"),
+                   help="منطقه‌ی زمانی برای تفسیر ساعت (خالی = ساعت سیستم)")
+    p.add_argument("--timeout", type=float, default=10.0, help="timeout هر درخواست (ثانیه)")
+    p.add_argument("--no-stop", action="store_true",
+                   help="بعد از اولین سفارش موفق هم ارسال را ادامه بده (پیش‌فرض: توقف)")
+    p.add_argument("--now", action="store_true", help="بدون انتظار، همین الان شروع کن (برای تست)")
+    p.add_argument("--dry-run", action="store_true", help="فقط نمایش درخواست، بدون ارسال")
+    p.add_argument("-y", "--yes", action="store_true", help="بدون پرسیدن تأیید نهایی")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    interactive = sys.stdin.isatty()
+
+    tz = None
+    if args.tz and ZoneInfo is not None:
+        try:
+            tz = ZoneInfo(args.tz)
+        except Exception:  # noqa: BLE001
+            log(yellow(f"⚠️  منطقه‌ی زمانی «{args.tz}» شناخته نشد؛ از ساعت سیستم استفاده می‌شود."))
+
+    log(bold(cyan("\n═══════════  ربات سفارش Exir  ═══════════\n")))
+
+    # ---------- ورودی‌ها ----------
+    try:
+        if not args.token and not args.cookie and not args.dry_run:
+            args.token = getpass.getpass("توکن لاگین (نمایش داده نمی‌شود): ").strip()
+        if not args.symbol:
+            args.symbol = ask("نماد / نام / ISIN سهم")
+        if args.quantity is None:
+            args.quantity = int(ask("تعداد"))
+        if args.price is None:
+            args.price = int(ask("قیمت (ریال)"))
+        if not args.time and not args.now:
+            args.time = ask("ساعت شروع (HH:MM:SS)")
+    except (EOFError, KeyboardInterrupt):
+        log(red("\nلغو شد."))
+        sys.exit(1)
+    except ValueError:
+        log(red("مقدار عددی نامعتبر."))
+        sys.exit(2)
+
+    if args.quantity <= 0 or args.price <= 0:
+        log(red("تعداد و قیمت باید بزرگ‌تر از صفر باشند."))
+        sys.exit(2)
+    if args.interval <= 0 or args.duration < 0:
+        log(red("interval باید مثبت و duration نامنفی باشد."))
+        sys.exit(2)
+    if not args.token and not args.cookie and not args.dry_run:
+        log(red("توکن یا کوکی لازم است."))
+        sys.exit(2)
+
+    isin = resolve_isin(args.symbol, interactive)
+
+    if args.now:
+        target = datetime.now(tz) + timedelta(seconds=3)
+    else:
+        try:
+            target = parse_target_time(args.time, tz, allow_tomorrow=False)
+        except ValueError as e:
+            log(red(str(e)))
+            sys.exit(2)
+        if target.timestamp() + args.duration < time.time():
+            log(red(f"⏰ زمان {target:%H:%M:%S} گذشته است. (برای تست فوری از --now استفاده کنید)"))
+            sys.exit(2)
+
+    interval = args.interval / 1000.0
+    count = int(args.duration / interval + 1e-9) + 1
+    start_ts = target.timestamp()
+    schedule = [start_ts + k * interval for k in range(count)]
+
+    base = args.base_url.rstrip("/")
+    url = base + ORDER_PATH
+    body = build_body(args, isin)
+    payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    session = build_session(args, pool=count)
+
+    # ---------- خلاصه ----------
+    log(bold("خلاصه‌ی سفارش:"))
+    log(f"  کارگزاری   : {base}")
+    log(f"  نماد/ISIN  : {args.symbol}  →  {isin}")
+    log(f"  نوع        : {'خرید' if args.side == 'buy' else 'فروش'}")
+    log(f"  تعداد      : {args.quantity:,}")
+    log(f"  قیمت       : {args.price:,} ریال   (ارزش کل ≈ {args.quantity * args.price:,} ریال)")
+    log(f"  شروع       : {target.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} ({args.tz or 'system'})")
+    log(f"  مدت/فاصله  : {args.duration:g} ثانیه / {args.interval} میلی‌ثانیه  →  {count} درخواست")
+    log(f"  توقف پس از موفقیت: {'خیر' if args.no_stop else 'بله'}")
+    log(f"  بدنه       : {json.dumps(body, ensure_ascii=False)}")
+    if args.dry_run:
+        log(yellow("\n[dry-run] هیچ درخواستی ارسال نشد.\nهدرها:"))
+        for k, v in session.headers.items():
+            if k.lower() in ("authorization", "cookie", args.auth_header.lower()):
+                v = v[:12] + "…" if len(v) > 12 else v
+            log(f"  {k}: {v}")
+        return
+
+    if interactive and not args.yes:
+        if input("\nادامه بدهم؟ (y/n) [y]: ").strip().lower() not in ("", "y", "yes", "بله", "ب"):
+            log("لغو شد.")
+            return
+
+    # ---------- انتظار ----------
+    stats = Stats()
+    stop_evt = threading.Event()
+    try:
+        # warm-up حدود ۵ ثانیه قبل از شروع (یا همین الان اگر زمان کمی مانده)
+        warm_ts = start_ts - 5
+        if warm_ts - time.time() > 0:
+            log(cyan(f"\n⏳ منتظر تا {target:%H:%M:%S} … (Ctrl+C برای لغو)"))
+            last_print = 0.0
+            while time.time() < warm_ts:
+                rem = start_ts - time.time()
+                if time.time() - last_print >= 1:
+                    with _print_lock:
+                        sys.stdout.write(f"\r   زمان فعلی {now_str(tz)}   |   باقی‌مانده {int(rem)//3600:02d}:{int(rem)%3600//60:02d}:{int(rem)%60:02d}   ")
+                        sys.stdout.flush()
+                    last_print = time.time()
+                time.sleep(min(0.2, max(0.0, warm_ts - time.time())))
+            print()
+        if time.time() < start_ts - 0.5:
+            warmup(session, base, tz)
+
+        # ---------- ارسال ----------
+        log(bold(yellow(f"\n🚀 شروع ارسال در {target:%H:%M:%S.%f}"[:-3] + "\n")))
+        with ThreadPoolExecutor(max_workers=min(count, 64)) as pool:
+            for k, ts in enumerate(schedule, 1):
+                if stop_evt.is_set():
+                    log(green(f"⏹  سفارش موفق دریافت شد؛ {count - k + 1} درخواست باقی‌مانده ارسال نشد."))
+                    break
+                wait_until(ts)
+                if stop_evt.is_set():
+                    log(green(f"⏹  سفارش موفق دریافت شد؛ {count - k + 1} درخواست باقی‌مانده ارسال نشد."))
+                    break
+                with stats.lock:
+                    stats.sent += 1
+                pool.submit(send_order, k, session, url, payload, args.timeout, tz,
+                            stats, stop_evt, not args.no_stop)
+            log(cyan("… منتظر دریافت پاسخ درخواست‌های در جریان"))
+    except KeyboardInterrupt:
+        log(red("\n⛔ توسط کاربر متوقف شد."))
+
+    # ---------- گزارش ----------
+    log(bold("\n═══════════  گزارش نهایی  ═══════════"))
+    log(f"  ارسال‌شده: {stats.sent}   موفق: {green(str(stats.success))}   ناموفق: {red(str(stats.failed))}")
+    for idx, sent_at, status, desc in sorted(stats.results):
+        st = status if status is not None else "ERR"
+        log(f"  #{idx:02d}  {sent_at}  HTTP {st}  {desc[:100]}")
+
+
+if __name__ == "__main__":
+    main()
