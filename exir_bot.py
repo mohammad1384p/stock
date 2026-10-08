@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import logging
 import os
 import re
 import sys
@@ -36,11 +37,14 @@ except ImportError:  # pragma: no cover
 
 from timesync import clock, sync as time_sync, DEFAULT_NTP_SERVERS
 from captcha_web import CaptchaPortal, resolve_mode
-from exir_auth import (CAPTCHA_TTL, ensure_token, jwt_exp, load_saved_token, describe_token,
+from exir_auth import (CAPTCHA_TTL, TOKEN_COOKIE, cookie_matches_host, ensure_token, jwt_exp,
+                       jwt_payload, load_saved_token, describe_token,
                        clean_token, security_hint)
+from exir_logging import (LEVELS, emit, get_logger, install_excepthook, mask, redact_headers,
+                          setup_logging)
 from session_capture import (apply_captured, browser_bootstrap, imported_token,
                              load_captured_session, normalize_mode, parse_browser_session,
-                             save_captured_session, security_cookie_warnings)
+                             save_captured_session, security_cookie_warnings, session_summary)
 
 try:
     from zoneinfo import ZoneInfo
@@ -76,9 +80,16 @@ def cyan(s): return _c("36", s)
 def bold(s): return _c("1", s)
 
 
+LOG = get_logger("bot")
+
+
 def log(*args) -> None:
+    """چاپ رنگی روی ترمینال + یک ردیف لاگ (برای فایل لاگ/دیباگ)."""
     with _print_lock:
         print(*args, flush=True)
+    text = " ".join(str(a) for a in args if a is not None)
+    if text.strip():
+        emit(LOG, logging.INFO, "console", text)
 
 
 def now_str(tz) -> str:
@@ -624,6 +635,148 @@ def identity_notes(session: requests.Session) -> list[str]:
     return notes
 
 
+# --------------------------------------------------------------------------- #
+#  عکسِ لحظه‌ای از نشست + چک‌لیستِ امنیتی (برای دیباگِ ۴۰۳/۹۰۰۹)
+# --------------------------------------------------------------------------- #
+def session_snapshot(session: requests.Session, base: str, *, token: str | None = None,
+                     auth_mode: str | None = None) -> dict:
+    """
+    وضعیتِ نشست را برای لاگ توصیف می‌کند — **بدون هیچ مقدار حساس**.
+
+    فقط نام کوکی‌ها (نه مقدار)، حضور/شکلِ هدرهای شناسایی، و سنِ توکن. این
+    همان چیزی است که هنگام ردِ امنیتی لازم داریم: «این درخواست با کدام نشست و
+    کدام هدرها رفت؟»
+    """
+    summary = session_summary(session, base)
+    host = requests.utils.urlparse(base).hostname or ""
+    jar = [c for c in session.cookies if cookie_matches_host(getattr(c, "domain", "") or "", host)]
+    if token is None:      # توکنِ نشست را از کوکی‌اش بخوان (بدون نیاز به ارجاع از بیرون)
+        for cookie in jar:
+            if getattr(cookie, "name", "") == TOKEN_COOKIE and getattr(cookie, "value", ""):
+                token = cookie.value
+                break
+    names = sorted({getattr(c, "name", "") for c in jar if getattr(c, "name", "")})
+    # هدرهایی که **واقعاً** با درخواست سفارش می‌روند (شامل هدر Cookie که requests
+    # از cookie-jar می‌سازد) — بدون ارسالِ هیچ درخواستی.
+    try:
+        prepped = session.prepare_request(requests.Request("POST", base + ORDER_PATH, data=b"{}"))
+        sent_headers = prepped.headers
+    except Exception:  # noqa: BLE001
+        sent_headers = session.headers
+    low_headers = {str(k).lower() for k in sent_headers}
+    info: dict = {
+        "base": base,
+        "auth_mode": auth_mode,
+        "cookie_names": names,
+        "token_cookie": TOKEN_COOKIE in names,
+        "token_cookie_count": sum(1 for c in jar if getattr(c, "name", "") == TOKEN_COOKIE),
+        "authorization_header": "authorization" in low_headers,
+        "missing_browser_cookies": summary.get("missing_browser_cookies", []),
+        "identity_headers": {k: sent_headers.get(k) for k in ("x-app-n", "clientid")
+                             if k in low_headers},
+        "headers": redact_headers(sent_headers),
+    }
+    if token:
+        payload = jwt_payload(token)
+        exp = jwt_exp(token)
+        info["token"] = {
+            "present": True,
+            "sub": payload.get("sub"),
+            "expires_at": (datetime.fromtimestamp(exp).isoformat(timespec="seconds") if exp else None),
+            "expires_in_s": int(exp - time.time()) if exp else None,
+            "expired": bool(exp and exp <= time.time()),
+        }
+    else:
+        info["token"] = {"present": bool(token)}
+    return info
+
+
+def log_snapshot(event: str, session: requests.Session, base: str, *, token: str | None = None,
+                 auth_mode: str | None = None, level: int = logging.INFO, message: str | None = None,
+                 **fields) -> dict:
+    """یک :func:`session_snapshot` کامل در لاگ می‌نویسد و آن را برمی‌گرداند."""
+    snap = session_snapshot(session, base, token=token, auth_mode=auth_mode)
+    payload = {k: v for k, v in snap.items() if k != "headers"}
+    if LOG.isEnabledFor(logging.DEBUG):     # هدرهای کامل فقط در سطح debug
+        payload["headers"] = snap["headers"]
+    payload.update(fields)
+    emit(LOG, level, event, message, **payload)
+    return snap
+
+
+def security_checklist(session: requests.Session, base: str, *, token: str | None = None,
+                       response=None, clock_offset: float | None = None) -> list[str]:
+    """
+    چک‌لیستِ «چرا کارگزاری درخواست را امنیتی رد کرد؟».
+
+    هر خط یک فرضیه‌ی قابل بررسی است (توکن، کوکیِ چالش، شکلِ x-app-n،
+    referer/origin، ساعت سیستم و …) و مستقیماً در لاگ نوشته می‌شود تا هنگام
+    ۴۰۳/۹۰۰۹ لازم نباشد حدس بزنیم.
+    """
+    snap = session_snapshot(session, base, token=token)
+    host = requests.utils.urlparse(base).hostname or ""
+    checks: list[str] = []
+
+    info = snap.get("token") or {}
+    if not info.get("present"):
+        checks.append("✘ هیچ توکنی روی نشست نیست (لاگین انجام نشده یا توکن منقضی بوده است).")
+    elif info.get("expired"):
+        checks.append("✘ توکن منقضی شده است؛ دوباره لاگین کنید (--login).")
+    else:
+        left = info.get("expires_in_s")
+        checks.append(f"✔ توکن معتبر است (حدود {left} ثانیه تا انقضا)"
+                      if left is not None else "✔ توکن روی نشست ست شده است.")
+
+    if snap["auth_mode"] in (None, "cookie", "both"):
+        if not snap["token_cookie"]:
+            checks.append(f"✘ کوکی {TOKEN_COOKIE} برای {host} در نشست نیست "
+                          "(--auth-mode cookie یا both را بررسی کنید).")
+        elif snap["token_cookie_count"] > 1:
+            checks.append(f"⚠ {snap['token_cookie_count']} مقدار مختلف برای کوکی {TOKEN_COOKIE} "
+                          "در نشست است؛ احراز هویت مبهم می‌شود (نشست را پاک و دوباره لاگین کنید).")
+        else:
+            checks.append(f"✔ کوکی {TOKEN_COOKIE} دقیقاً یک بار ارسال می‌شود.")
+    if snap["authorization_header"]:
+        checks.append("ℹ هدر Authorization هم فرستاده می‌شود (--auth-mode bearer/both).")
+
+    missing = snap["missing_browser_cookies"]
+    if missing:
+        checks.append("⚠ کوکی‌های چالش/مرورگر که در این نشست نیستند: " + ", ".join(missing)
+                      + " — با --import-session (Copy as cURL) یا --browser-login اضافه کنید.")
+    else:
+        checks.append("✔ کوکی‌های چالشِ شناخته‌شده در نشست هستند.")
+
+    app_n = (snap["identity_headers"] or {}).get("x-app-n")
+    if app_n is None:
+        checks.append("⚠ هدر x-app-n فرستاده نمی‌شود؛ اگر مرورگر آن را می‌فرستد با --app-n بدهید.")
+    elif re.fullmatch(r"NaN\.[0-9]+", str(app_n).strip()):
+        checks.append("⚠ x-app-n الگوی «NaN.<عدد>» دارد (شکلِ نمونه‌ی مرورگر <۱۳ رقم>.<۸ رقم> است)؛ "
+                      "مقدار واقعی را با --app-n بدهید.")
+    else:
+        checks.append(f"✔ x-app-n ست شده است ({app_n}).")
+    checks.append("ℹ clientid=" + repr((snap["identity_headers"] or {}).get("clientid", "«فرستاده نمی‌شود»")))
+
+    headers = {k.lower(): v for k, v in session.headers.items()}
+    origin_ok = str(headers.get("origin", "")).rstrip("/") == base
+    referer = str(headers.get("referer", ""))
+    checks.append(f"{'✔' if origin_ok else '⚠'} origin={'هم‌ریشه با کارگزار' if origin_ok else headers.get('origin')}")
+    checks.append(f"{'✔' if referer.startswith(base) else '⚠'} referer={referer or '«ست نشده»'}")
+
+    if response is not None:
+        set_cookie = response.headers.get("set-cookie")
+        if set_cookie:
+            names = [p.split("=")[0].strip() for p in set_cookie.split(",") if "=" in p]
+            checks.append("ℹ کارگزار در همین پاسخ کوکی ست کرده است: " + (", ".join(names) or "?"))
+        if response.status_code in (301, 302, 303, 307, 308):
+            checks.append(f"✘ پاسخ ریدایرکت ({response.status_code}) است؛ یعنی نشست از دید کارگزار "
+                          "معتمد نبود (معمولاً توکن/کوکیِ چالش).")
+
+    if clock_offset is not None and abs(clock_offset) > 2:
+        checks.append(f"⚠ اختلاف ساعت شما با سرور کارگزاری {clock_offset:+.1f}s است؛ "
+                      "برای درخواست‌های زمان‌دار/امضا‌شده مشکل‌ساز است (--time-sync ntp).")
+    return checks
+
+
 def warmup(session: requests.Session, base: str, tz) -> None:
     """برقراری اتصال TLS قبل از زمان هدف + نمایش اختلاف ساعت با سرور."""
     try:
@@ -633,10 +786,13 @@ def warmup(session: requests.Session, base: str, tz) -> None:
         rtt = (t1 - t0) * 1000
         msg = f"🔌 اتصال آماده شد (HTTP {r.status_code}, RTT ≈ {rtt:.0f}ms)"
         date_h = r.headers.get("Date")
+        offset = None
         if date_h:
             server = parsedate_to_datetime(date_h).timestamp() + 0.5
             offset = server - ((t0 + t1) / 2 + clock.offset)  # دقت حدود ±۰.۵ ثانیه (هدر Date ثانیه‌ای است)
             msg += f" | ساعت سرور کارگزاری نسبت به ساعت همگام‌شده: {offset:+.1f}s"
+        emit(LOG, logging.INFO, "session.warmup", msg, status=r.status_code,
+             rtt_ms=round(rtt, 1), server_offset_s=None if offset is None else round(offset, 2))
         log(cyan(msg))
     except Exception as e:  # noqa: BLE001
         log(yellow(f"⚠️  warm-up ناموفق بود (مشکلی نیست، ادامه می‌دهیم): {e}"))
@@ -679,6 +835,17 @@ def security_rejected(status: int, data) -> bool:
     return str(data.get("errorCode", "")) == "9009"
 
 
+def _log_stop(stats: Stats, remaining: int) -> None:
+    """توقفِ ارسال را هم روی ترمینال می‌نویسد و هم در لاگ (با علت و تعدادِ باقی‌مانده)."""
+    with stats.lock:
+        reason = stats.stop_reason
+    emit(LOG, logging.ERROR if reason == "security" else logging.WARNING,
+         "run.stopped", stop_message(stats, remaining),
+         reason=reason or "user", remaining=remaining,
+         sent=stats.sent, success=stats.success, failed=stats.failed)
+    log(stop_message(stats, remaining))
+
+
 def stop_message(stats: Stats, remaining: int) -> str:
     with stats.lock:
         reason = stats.stop_reason
@@ -693,9 +860,21 @@ def stop_message(stats: Stats, remaining: int) -> str:
 
 def send_order(idx: int, session: requests.Session, url: str, payload: bytes,
                timeout: float, tz, stats: Stats, stop_evt: threading.Event,
-               stop_on_success: bool) -> None:
+               stop_on_success: bool, *, base: str | None = None) -> None:
     sent_at = now_str(tz)
     t0 = time.perf_counter()
+    site = base or "/".join(url.split("/")[:3])
+    # هدر/بدنه‌ای که واقعاً می‌رود: در سطح debug همیشه لاگ می‌شود تا بعداً بتوان
+    # درخواستِ ربات را با درخواستِ مرورگر (DevTools) مقایسه کرد.
+    if LOG.isEnabledFor(logging.DEBUG):
+        try:
+            prepped = session.prepare_request(requests.Request("POST", url, data=payload))
+            emit(LOG, logging.DEBUG, "order.request", f"#{idx:02d} → POST {url}",
+                 idx=idx, url=url, headers=redact_headers(prepped.headers),
+                 body=payload.decode("utf-8", "replace") if isinstance(payload, bytes) else payload)
+        except Exception as e:  # noqa: BLE001
+            emit(LOG, logging.DEBUG, "order.request", f"#{idx:02d} آماده‌سازی درخواست ناموفق: {e}",
+                 idx=idx, url=url)
     try:
         # Never follow an order redirect to a login HTML page and call it a
         # successful order; also avoid replaying POST data to a redirect target.
@@ -729,6 +908,36 @@ def send_order(idx: int, session: requests.Session, url: str, payload: bytes,
                 stop_evt.set()
         head = f"#{idx:02d}  ارسال {sent_at}  ←  دریافت {now_str(tz)}  ({ms:.0f}ms)  HTTP {r.status_code}"
         extra = ""
+        # ---- لاگِ ساخت‌یافته‌ی نتیجه (فایل لاگ/سطح debug) ----
+        result_fields = {"idx": idx, "status": r.status_code, "elapsed_ms": round(ms, 1),
+                         "ok": ok, "rejected": rejected, "sent_at": sent_at,
+                         "content_type": r.headers.get("content-type"),
+                         "redirect_to": r.headers.get("location"),
+                         "set_cookie_names": [p.split("=")[0].strip()
+                                              for p in (r.headers.get("set-cookie") or "").split(",")
+                                              if "=" in p] or None}
+        if isinstance(data, dict):
+            result_fields["error_code"] = data.get("errorCode")
+            result_fields["description"] = desc
+        if LOG.isEnabledFor(logging.DEBUG):
+            result_fields["response_headers"] = redact_headers(r.headers)
+            result_fields["response_body"] = (body or "")[:4000]
+        emit(LOG, logging.INFO if ok else logging.WARNING,
+             "order.result" if ok else "order.failed", head, **result_fields)
+        if rejected:
+            # ردِ احراز هویت/امنیت: خطا با بالاترین سطح + چک‌لیستِ فرضیه‌ها
+            emit(LOG, logging.ERROR, "order.security_rejected",
+                 f"#{idx:02d} کارگزاری درخواست را با HTTP {r.status_code} و خطای امنیتی رد کرد؛ "
+                 "ادامه‌ی ارسال متوقف می‌شود",
+                 idx=idx, status=r.status_code,
+                 error_code=(data or {}).get("errorCode") if isinstance(data, dict) else None,
+                 description=desc,
+                 request=format_request(getattr(r, "request", None), mask=True),
+                 response_body=(body or "")[:4000],
+                 checklist=security_checklist(session, site, response=r,
+                                              clock_offset=clock.offset),
+                 hint="برای مقایسه با مرورگر: DevTools ← Copy as fetch ← "
+                      "python compare_request.py <فایل> | یا python probe_order.py --app-n-candidate <مقدار> --yes")
         if not ok:
             hint = order_hint(r.status_code, data if data is not None else body)
             if hint:
@@ -743,6 +952,8 @@ def send_order(idx: int, session: requests.Session, url: str, payload: bytes,
         with stats.lock:
             stats.failed += 1
             stats.results.append((idx, sent_at, None, str(e)))
+        emit(LOG, logging.ERROR, "order.network_error", f"#{idx:02d} خطای شبکه: {e}",
+             idx=idx, elapsed_ms=round(ms, 1), url=url, error=repr(e))
         log(red(f"✘ #{idx:02d}  ارسال {sent_at}  ({ms:.0f}ms)  خطای شبکه: {e}") + "\n" + "─" * 60)
 
 
@@ -827,6 +1038,21 @@ def record_browser_result(res: dict, *, tz, stats: Stats, log, offset_ms: int = 
     head = (f"#{idx:02d}  ارسال {sent_dt.strftime('%H:%M:%S.%f')[:-3]}  ←  دریافت "
             f"{got_dt.strftime('%H:%M:%S.%f')[:-3]}  ({ms}ms)  HTTP {status or 'ERR'}  🌐مرورگر")
     extra = ""
+    fields = {"idx": idx, "status": status or None, "elapsed_ms": ms, "ok": ok, "rejected": rejected,
+              "browser": True, "error": network_error, "description": desc or None}
+    if isinstance(data, dict):
+        fields["error_code"] = data.get("errorCode")
+    if LOG.isEnabledFor(logging.DEBUG):
+        fields["response_body"] = (body or "")[:4000]
+    emit(LOG, logging.INFO if ok else logging.WARNING,
+         "order.result" if ok else "order.failed", head, **fields)
+    if rejected:
+        emit(LOG, logging.ERROR, "order.security_rejected",
+             f"#{idx:02d} کارگزاری درخواستِ داخل مرورگر را با HTTP {status} رد کرد؛ ارسال متوقف می‌شود",
+             idx=idx, status=status, browser=True, description=desc,
+             response_body=(body or "")[:4000],
+             hint="حتی درخواستِ مرورگرِ واقعی رد شده است: کوکی/هدرِ نشست را با "
+                  "--browser-login دوباره بسازید و با probe_order.py بررسی کنید.")
     if not ok:
         hint = order_hint(status, data if data is not None else body)
         if hint:
@@ -903,7 +1129,7 @@ def ask(prompt: str, default: str | None = None) -> str:
             return default
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="ربات ارسال سفارش زمان‌دار برای Exir (هر آرگومانی که ندهید، تعاملی پرسیده می‌شود)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -986,15 +1212,40 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--timeout", type=float, default=10.0, help="timeout هر درخواست (ثانیه)")
     p.add_argument("--no-stop", action="store_true",
                    help="بعد از اولین سفارش موفق هم ارسال را ادامه بده (پیش‌فرض: توقف)")
+    g = p.add_argument_group("لاگ / دیباگ (برای رفع ۴۰۳/۹۰۰۹)")
+    g.add_argument("--log-level", choices=sorted(LEVELS),
+                   default=(os.environ.get("EXIR_LOG_LEVEL") or "info").strip().lower(),
+                   help="سطح لاگ: debug = هدرها و بدنه‌ی کامل هر درخواست/پاسخ (مقادیر حساس پوشیده می‌شود)")
+    g.add_argument("--log-file", default=os.environ.get("EXIR_LOG_FILE"),
+                   help="مسیر فایل لاگ (چرخشی؛ پیش‌فرض: فقط ترمینال). مثال: logs/exir.log")
+    g.add_argument("--log-format", choices=["text", "json"],
+                   default=(os.environ.get("EXIR_LOG_FORMAT") or "text").strip().lower(),
+                   help="قالب فایل لاگ: متن خوانا یا JSON یک‌خطی (برای jq)")
+    g.add_argument("--log-console", choices=["auto", "on", "off"],
+                   default=(os.environ.get("EXIR_LOG_CONSOLE") or "auto").strip().lower(),
+                   help="نمایش لاگ روی ترمینال: auto = فقط warning به بالا (خروجی رنگی تکرار نمی‌شود)")
     p.add_argument("--now", action="store_true", help="بدون انتظار، همین الان شروع کن (برای تست)")
     p.add_argument("--dry-run", action="store_true", help="فقط نمایش درخواست، بدون ارسال")
     p.add_argument("-y", "--yes", action="store_true", help="بدون پرسیدن تأیید نهایی")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def main() -> None:
     args = parse_args()
     interactive = sys.stdin.isatty()
+
+    # ---------- لاگینگ (پیش از هر کاری، تا خطاهای زودهنگام هم ثبت شوند) ----------
+    if args.log_level not in LEVELS:      # مقدارِ نامعتبر از متغیر محیطی
+        args.log_level = "info"
+    setup_logging(args.log_level, args.log_file, args.log_format, console=args.log_console)
+    install_excepthook(LOG)
+    emit(LOG, logging.INFO, "run.start", "اجرای ربات شروع شد",
+         base=args.base_url, tz=args.tz or "system", side=args.side,
+         duration=args.duration, interval_ms=args.interval, timeout=args.timeout,
+         auth_mode=args.auth_mode, bootstrap=getattr(args, "bootstrap", None),
+         browser_order=bool(getattr(args, "browser_order", False)),
+         dry_run=bool(args.dry_run), log_level=args.log_level,
+         log_file=args.log_file or None, log_format=args.log_format)
 
     tz = None
     if args.tz and ZoneInfo is not None:
@@ -1048,6 +1299,9 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         log(red(f"✘ {e}"))
         sys.exit(3)
+    # نشست پس از لاگین/بازیابی توکن: اولین عکسِ لحظه‌ای برای دیباگِ ۴۰۳/۹۰۰۹
+    log_snapshot("session.after_login", session, base, token=token, auth_mode=args.auth_mode,
+                 message="نشست پس از لاگین (فقط نام کوکی‌ها، نه مقدار)")
     if args.login_only:
         return
 
@@ -1163,6 +1417,11 @@ def main() -> None:
     if args.dry_run:
         log(yellow("\n[dry-run] هیچ درخواستی ارسال نشد. درخواستی که فرستاده می‌شد:"))
         log(preview_request(session, "POST", url, payload))
+        emit(LOG, logging.INFO, "order.dry_run", "درخواستِ فرضی (ارسال نشد)",
+             url=url, body=payload.decode("utf-8", "replace"),
+             request=preview_request(session, "POST", url, payload),
+             snapshot=session_snapshot(session, base, token=token, auth_mode=args.auth_mode),
+             checklist=security_checklist(session, base, clock_offset=clock.offset))
         return
 
     if getattr(args, "browser_order", False) and not browser_orders_available():
@@ -1209,8 +1468,18 @@ def main() -> None:
         # آخرین حرف را «نشست مرورگر» می‌زند: پاسخِ همان warm-up هم می‌تواند کوکی چالش را
         # با مقدار دیگری بازنویسی کند (سرور برای درخواستِ بدونِ نشانه‌ی مرورگر مقدار تازه می‌دهد).
         apply_saved_captured_session(session, args, log, quiet=True)
+        # مهم‌ترین عکسِ لحظه‌ای: دقیقاً همان نشستی که سفارش‌ها با آن فرستاده می‌شوند
+        log_snapshot("session.pre_send", session, base, token=token, auth_mode=args.auth_mode,
+                     message="نشست در لحظه‌ی ارسال (آخرین bootstrap انجام شده)",
+                     requests=count, start=target.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                     clock_source=clock.source, clock_offset_s=round(clock.offset, 3))
 
         # ---------- ارسال ----------
+        emit(LOG, logging.INFO, "run.schedule", f"{count} درخواست زمان‌بندی شد",
+             count=count, start=target.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+             interval_ms=args.interval, duration_s=args.duration,
+             stop_on_success=not args.no_stop,
+             transport="browser" if getattr(args, "browser_order", False) else "requests")
         log(bold(yellow(f"\n🚀 شروع ارسال در {target:%H:%M:%S.%f}"[:-3] + "\n")))
         if getattr(args, "browser_order", False):
             run_browser_orders(session, args, log, base=base, url=url, payload=payload,
@@ -1220,16 +1489,16 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=min(count, 64)) as pool:
             for k, ts in enumerate(schedule, 1):
                 if stop_evt.is_set():
-                    log(stop_message(stats, count - k + 1))
+                    _log_stop(stats, count - k + 1)
                     break
                 wait_until(ts)
                 if stop_evt.is_set():
-                    log(stop_message(stats, count - k + 1))
+                    _log_stop(stats, count - k + 1)
                     break
                 with stats.lock:
                     stats.sent += 1
                 pool.submit(send_order, k, session, url, payload, args.timeout, tz,
-                            stats, stop_evt, not args.no_stop)
+                            stats, stop_evt, not args.no_stop, base=base)
             log(cyan("… منتظر دریافت پاسخ درخواست‌های در جریان"))
     except KeyboardInterrupt:
         log(red("\n⛔ توسط کاربر متوقف شد."))
@@ -1239,6 +1508,11 @@ def main() -> None:
 
 def _print_report(stats: Stats, tz) -> None:
     """گزارش نهایی (مشترک بین ارسال با requests و داخل مرورگر)."""
+    emit(LOG, logging.INFO, "run.report", "گزارش نهایی",
+         sent=stats.sent, success=stats.success, failed=stats.failed,
+         stop_reason=stats.stop_reason,
+         results=[{"idx": i, "sent_at": at, "status": st, "description": d}
+                  for i, at, st, d in sorted(stats.results)])
     log(bold("\n═══════════  گزارش نهایی  ═══════════"))
     log(f"  ارسال‌شده: {stats.sent}   موفق: {green(str(stats.success))}   ناموفق: {red(str(stats.failed))}")
     for idx, sent_at, status, desc in sorted(stats.results):

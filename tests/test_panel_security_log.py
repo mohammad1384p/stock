@@ -5,6 +5,7 @@
 """
 import base64
 import json
+import logging
 import threading
 import time
 import unittest
@@ -17,6 +18,7 @@ from urllib.request import urlopen
 
 import web_panel
 from exir_auth import save_token
+from exir_logging import forget_secrets, setup_logging
 from web_panel import PanelState, panel_handler
 
 
@@ -98,6 +100,8 @@ class PanelSecurityRejectionTests(unittest.TestCase):
             "--captcha-file", str(Path(cls.tmp.name) / "captcha.png"),
         ])
         cls.state = PanelState(args)
+        cls.log_file = Path(cls.tmp.name) / "panel.log"
+        setup_logging("debug", str(cls.log_file), "text", console="off")
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), panel_handler(cls.state))
         cls.httpd.daemon_threads = True
         cls.state.port = cls.httpd.server_address[1]
@@ -107,6 +111,7 @@ class PanelSecurityRejectionTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        forget_secrets()
         cls.state.shutdown()
         cls.httpd.shutdown()
         cls.httpd.server_close()
@@ -145,6 +150,17 @@ class PanelSecurityRejectionTests(unittest.TestCase):
         self.assertEqual(len(self.broker.orders), 1)
         self.assertEqual(self.state.stats.sent, 1)
         self.assertEqual(self.state.stats.stop_reason, "security")
+
+        # ---- لاگِ فایل: رخدادهای ساخت‌یافته و بدون مقدار حساس ----
+        for handler in logging.getLogger("exir").handlers:
+            handler.flush()
+        log_text = self.log_file.read_text(encoding="utf-8")
+        self.assertIn("order.security_rejected", log_text)
+        self.assertIn("panel.session.pre_send", log_text)
+        self.assertIn("run.stopped", log_text)
+        self.assertIn("error_code=9009", log_text)
+        self.assertNotIn(fake_jwt(), log_text)
+        self.assertNotIn(fake_jwt()[:40], log_text)
         first = snap["stats"]["results"][0]
         self.assertEqual(first["status"], 403)
         self.assertIn("امنیتی", first["desc"])

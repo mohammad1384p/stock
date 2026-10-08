@@ -29,6 +29,7 @@ import hmac
 import html as html_mod
 import http.client
 import json
+import logging
 import os
 import re
 import secrets
@@ -55,6 +56,8 @@ except ImportError:  # pragma: no cover
 
 import exir_bot
 from captcha_web import CaptchaPortal, local_ip
+from exir_logging import (LEVELS, emit, get_logger, install_excepthook, register_secret,
+                          setup_logging)
 from exir_auth import (CAPTCHA_TTL, apply_token, clean_token, describe_token, jwt_exp,
                        load_saved_token, login, restore_session_cookies, save_token,
                        session_cookies)
@@ -109,6 +112,7 @@ def fmt_ms(moment: datetime) -> str:
 # --------------------------------------------------------------------------- #
 _TERMINAL_LOG = exir_bot.log
 STATE: "PanelState | None" = None
+LOG = get_logger("panel")
 
 
 def panel_log(*parts) -> None:
@@ -542,6 +546,17 @@ def _load_token_into(session, cfg: SimpleNamespace, base: str) -> str | None:
     return token
 
 
+def _log_stop(stats: "exir_bot.Stats", remaining: int) -> None:
+    """توقف را در بافر پنل می‌نویسد و همزمان رخدادِ ``run.stopped`` را لاگ می‌کند."""
+    text = stop_message(stats, remaining)
+    with stats.lock:
+        reason = stats.stop_reason
+    emit(LOG, logging.ERROR if reason == "security" else logging.WARNING, "run.stopped", text,
+         reason=reason or "user", remaining=remaining, sent=stats.sent,
+         success=stats.success, failed=stats.failed)
+    panel_log(text)
+
+
 def _fire(state: PanelState, cfg: SimpleNamespace, session, base: str, stop_evt: threading.Event,
           stats: Stats) -> None:
     """انتظار تا زمان هدف و ارسال زمان‌بندی‌شده (همان منطق exir_bot.main)."""
@@ -617,6 +632,16 @@ def _fire(state: PanelState, cfg: SimpleNamespace, session, base: str, stop_evt:
     with state.lock:
         state.plan = plan
 
+    # عکسِ لحظه‌ای از نشست: هنگام ۴۰۳/۹۰۰۹ باید بدانیم کدام کوکی/هدر رفته است
+    emit(LOG, logging.INFO, "panel.run.plan", "سفارش از پنل زمان‌بندی شد",
+         symbol=cfg.symbol, isin=isin, side=cfg.side, quantity=cfg.quantity, price=cfg.price,
+         count=count, interval_ms=cfg.interval, duration_s=cfg.duration,
+         start=plan["start_display"], dry_run=cfg.dry_run,
+         clock_source=clock.source, clock_offset_s=round(clock.offset, 3))
+    exir_bot.log_snapshot("panel.session.pre_send", session, base, token=state.token,
+                          auth_mode=cfg.auth_mode,
+                          message="نشستِ پنل در لحظه‌ی ارسال (فقط نام کوکی‌ها)")
+
     panel_log("خلاصه‌ی سفارش:")
     panel_log(f"  نماد/ISIN  : {cfg.symbol}  →  {isin}")
     panel_log(f"  نوع        : {'فروش' if cfg.side == 'sell' else 'خرید'}")
@@ -634,6 +659,9 @@ def _fire(state: PanelState, cfg: SimpleNamespace, session, base: str, stop_evt:
 
     if cfg.dry_run:
         panel_log("[dry-run] هیچ درخواستی ارسال نمی‌شود. درخواستی که فرستاده می‌شد:")
+        emit(LOG, logging.INFO, "order.dry_run", "درخواستِ فرضیِ پنل (ارسال نشد)", url=url,
+             request=exir_bot.preview_request(session, "POST", url, payload),
+             checklist=exir_bot.security_checklist(session, base, clock_offset=clock.offset))
         for block_line in exir_bot.preview_request(session, "POST", url, payload).splitlines():
             panel_log("  " + block_line)
         state.set_status("dry-run", "اجرای آزمایشی تمام شد؛ درخواستی ارسال نشد.")
@@ -688,11 +716,11 @@ def _fire(state: PanelState, cfg: SimpleNamespace, session, base: str, stop_evt:
     with ThreadPoolExecutor(max_workers=min(count, 64)) as pool:
         for k, ts in enumerate(schedule, 1):
             if stop_evt.is_set():
-                panel_log(stop_message(stats, count - k + 1))
+                _log_stop(stats, count - k + 1)          # ترمینال + بافر پنل + لاگ
                 break
             wait_until(ts)
             if stop_evt.is_set():
-                panel_log(stop_message(stats, count - k + 1))
+                _log_stop(stats, count - k + 1)          # ترمینال + بافر پنل + لاگ
                 break
             with stats.lock:
                 stats.sent += 1
@@ -757,13 +785,17 @@ def _worker_run(state: PanelState, req: dict) -> None:
         panel_log(f"⏹ {e}")
     except PanelError as e:
         panel_log(f"✘ {e}")
+        emit(LOG, logging.ERROR, "panel.run.error", str(e), error_kind="PanelError")
         state.set_status("error", str(e))
     except SystemExit:  # resolve_isin برای نماد نامعتبر sys.exit می‌کند
         msg = "کد ISIN نماد پیدا نشد؛ مستقیماً ISIN بدهید یا symbols.json را کامل کنید."
         panel_log(f"✘ {msg}")
+        emit(LOG, logging.ERROR, "panel.run.error", msg, error_kind="SystemExit")
         state.set_status("error", msg)
     except Exception as e:  # noqa: BLE001
         panel_log(f"✘ خطای غیرمنتظره: {e!r}")
+        emit(LOG, logging.ERROR, "panel.run.error", "خطای غیرمنتظره در اجرای پنل",
+             error=repr(e), error_kind=type(e).__name__, exc_info=True)
         state.set_status("error", f"خطا: {e}")
     finally:
         with state.lock:
@@ -1734,6 +1766,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--ntp-server", action="append",
                    help="سرور NTP دلخواه (چند بار مجاز)")
     p.add_argument("--timeout", type=float, default=10.0, help="timeout هر درخواست سفارش (ثانیه)")
+    g = p.add_argument_group("لاگ / دیباگ")
+    g.add_argument("--log-level", choices=sorted(LEVELS),
+                   default=(os.environ.get("EXIR_LOG_LEVEL") or "info").strip().lower(),
+                   help="سطح لاگ (debug = هدرها و بدنه‌ی هر درخواست/پاسخ، با مقادیر حساس پوشیده)")
+    g.add_argument("--log-file", default=os.environ.get("EXIR_LOG_FILE"),
+                   help="مسیر فایل لاگِ پنل (چرخشی؛ پیش‌فرض: فقط ترمینال)")
+    g.add_argument("--log-format", choices=["text", "json"],
+                   default=(os.environ.get("EXIR_LOG_FORMAT") or "text").strip().lower(),
+                   help="قالب فایل لاگ")
+    g.add_argument("--log-console", choices=["auto", "on", "off"],
+                   default=(os.environ.get("EXIR_LOG_CONSOLE") or "auto").strip().lower(),
+                   help="نمایش لاگ روی ترمینال (auto = فقط warning به بالا)")
     args = p.parse_args(argv)
     if args.panel_key and args.panel_key.strip() and len(args.panel_key.strip()) < PANEL_KEY_MIN_LEN:
         p.error(f"--panel-key باید حداقل {PANEL_KEY_MIN_LEN} نویسه باشد.")
@@ -1772,6 +1816,15 @@ def _banner(state: PanelState, args: argparse.Namespace) -> None:
 def main(argv=None) -> int:
     global STATE
     args = parse_args(argv)
+    # لاگینگ پیش از هر چیز: خطاهای زودهنگامِ پنل هم در فایل لاگ ثبت می‌شوند
+    if args.log_level not in LEVELS:      # مقدار نامعتبر از متغیر محیطی
+        args.log_level = "info"
+    setup_logging(args.log_level, args.log_file, args.log_format, console=args.log_console)
+    register_secret(args.panel_key)      # کلید دسترسی پنل هرگز وارد لاگ نمی‌شود
+    install_excepthook(LOG)
+    emit(LOG, logging.INFO, "panel.start", "وب‌پنل بالا می‌آید",
+         base=args.base_url, tz=args.tz, auth_mode=args.auth_mode,
+         log_level=args.log_level, log_file=args.log_file or None)
     state = PanelState(args)
     STATE = state
     try:
