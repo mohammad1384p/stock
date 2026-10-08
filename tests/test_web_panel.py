@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import time
 import unittest
@@ -26,9 +27,13 @@ REQ = {
 }
 
 
-def call(url: str, data: dict | None = None, method: str | None = None):
+def call(url: str, data: dict | None = None, method: str | None = None, key: str | None = None,
+         extra_headers: dict | None = None):
     body = json.dumps(data).encode("utf-8") if data is not None else None
     headers = {"Content-Type": "application/json"} if body else {}
+    if key:
+        headers[web_panel.PANEL_KEY_HEADER] = key
+    headers.update(extra_headers or {})
     req = UrlRequest(url, data=body, headers=headers, method=method)
     try:
         with urlopen(req, timeout=15) as resp:
@@ -161,6 +166,7 @@ class PanelHTTPTests(unittest.TestCase):
         cls.httpd.daemon_threads = True
         cls.state.port = cls.httpd.server_address[1]
         cls.base = f"http://127.0.0.1:{cls.state.port}"
+        cls.key = cls.state.panel_key
         threading.Thread(target=cls.httpd.serve_forever, kwargs={"poll_interval": 0.05},
                          daemon=True, name="panel-test").start()
 
@@ -189,7 +195,7 @@ class PanelHTTPTests(unittest.TestCase):
     def poll_until(self, predicate, timeout=20.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            _, _, raw = call(self.base + "/api/state?after=0")
+            _, _, raw = call(self.base + "/api/state?after=0", key=self.key)
             snap = json.loads(raw)
             if predicate(snap):
                 return snap
@@ -211,7 +217,7 @@ class PanelHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(raw)["ok"])
 
-        status, _, raw = call(self.base + "/api/state?after=0")
+        status, _, raw = call(self.base + "/api/state?after=0", key=self.key)
         snap = json.loads(raw)
         self.assertEqual(snap["status"], "idle")
         self.assertEqual(snap["tz"], "Asia/Tehran")
@@ -219,16 +225,17 @@ class PanelHTTPTests(unittest.TestCase):
         self.assertIn("token", snap)
         self.assertIn("login", snap)
 
-        status, _, _ = call(self.base + "/nope")
+        status, _, _ = call(self.base + "/nope", key=self.key)
         self.assertEqual(status, 404)
 
     def test_start_rejects_invalid_input(self):
-        status, _, raw = call(self.base + "/api/start", {"symbol": "", "quantity": 1, "price": 1}, method="POST")
+        status, _, raw = call(self.base + "/api/start", {"symbol": "", "quantity": 1, "price": 1},
+                              method="POST", key=self.key)
         self.assertEqual(status, 400)
         self.assertIn("نماد", json.loads(raw)["error"])
 
     def test_stop_without_run(self):
-        status, _, raw = call(self.base + "/api/stop", {}, method="POST")
+        status, _, raw = call(self.base + "/api/stop", {}, method="POST", key=self.key)
         self.assertEqual(status, 200)
         self.assertFalse(json.loads(raw)["stopped"])
 
@@ -237,6 +244,7 @@ class PanelHTTPTests(unittest.TestCase):
         import requests
 
         with requests.Session() as s:
+            s.headers[web_panel.PANEL_KEY_HEADER] = self.key
             for _ in range(3):
                 r = s.post(self.base + "/api/stop", json={}, timeout=10)
                 self.assertEqual(r.status_code, 200, r.text)
@@ -246,7 +254,7 @@ class PanelHTTPTests(unittest.TestCase):
 
     def test_dry_run_offline_end_to_end(self):
         req = dict(REQ, symbol="IRO7TONP0001", dry_run=True, time_sync="off", now=True)
-        status, _, raw = call(self.base + "/api/start", req, method="POST")
+        status, _, raw = call(self.base + "/api/start", req, method="POST", key=self.key)
         self.assertEqual(status, 200, raw)
         snap = self.poll_until(lambda s: s["status"] == "dry-run")
         self.assertTrue(snap["plan"]["dry_run"])
@@ -266,7 +274,7 @@ class PanelHTTPTests(unittest.TestCase):
             status, _, raw = call(self.base + "/Tok3n/captcha.jpg")
             self.assertEqual(status, 200, raw)
             self.assertEqual(raw, b"pong")
-            status, _, raw = call(self.base + "/api/state")
+            status, _, raw = call(self.base + "/api/state", key=self.key)
             self.assertEqual(json.loads(raw)["login"]["captcha"], "/Tok3n/")
         finally:
             with self.state.lock:
@@ -274,6 +282,83 @@ class PanelHTTPTests(unittest.TestCase):
 
     def stub_port(self) -> int:
         return self.stub.server_address[1]
+
+    # ---------- کلید پنل ----------
+    def test_api_refuses_requests_without_the_panel_key(self):
+        for url in ("/api/state?after=0", "/api/symbols", "/nope"):
+            status, _, raw = call(self.base + url)
+            self.assertEqual(status, 401, url)
+            self.assertIn("X-Panel-Key", json.loads(raw)["error"])
+        status, _, _ = call(self.base + "/api/state?after=0", key="w" * 32)
+        self.assertEqual(status, 401)
+        self.assertEqual(call(self.base + "/api/state?after=0", key=self.key)[0], 200)
+
+    def test_public_paths_stay_open_without_key(self):
+        status, _, raw = call(self.base + "/")
+        self.assertEqual(status, 200)
+        self.assertIn("X-Panel-Key", raw.decode("utf-8"))   # صفحه‌ی پنل هدر کلید را می‌فرستد
+        status, _, raw = call(self.base + "/api/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw), {"ok": True})      # بدون کلید: فقط سلامت، بدون نسخه/وضعیت
+        _, _, raw = call(self.base + "/api/health", key=self.key)
+        self.assertIn("version", json.loads(raw))
+
+    def test_post_without_key_cannot_start_a_run(self):
+        req = dict(REQ, symbol="IRO7TONP0001", dry_run=True, time_sync="off", now=True)
+        status, _, raw = call(self.base + "/api/start", req, method="POST")
+        self.assertEqual(status, 401, raw)
+        self.assertFalse(self.state.is_running())
+        self.assertEqual(self.state.status, "idle")
+
+    def test_wrong_key_is_refused_for_every_action(self):
+        req = dict(REQ, symbol="IRO7TONP0001", dry_run=True, time_sync="off", now=True)
+        actions = (("/api/start", req), ("/api/login", {"username": "u", "password": "p"}),
+                   ("/api/forget-token", {}), ("/api/clear-log", {}), ("/api/sync", {}), ("/api/stop", {}))
+        for path, body in actions:
+            status, _, _ = call(self.base + path, body, method="POST", key="w" * 32)
+            self.assertEqual(status, 401, path)
+        self.assertFalse(self.state.is_running())
+        self.assertEqual(self.state.login_state, "idle")
+
+    def test_text_plain_form_post_from_another_site_is_refused(self):
+        # فرم HTML بیرونی: Content-Type متن ساده و بدون هدر کلید؛ حتی با Origin جعلی نباید اجرا شود
+        req = dict(REQ, symbol="IRO7TONP0001", dry_run=True, time_sync="off", now=True)
+        status, _, _ = call(self.base + "/api/start", req, method="POST",
+                            extra_headers={"Content-Type": "text/plain", "Origin": "https://evil.example"})
+        self.assertEqual(status, 401)
+        self.assertFalse(self.state.is_running())
+
+    def test_cors_preflight_is_not_answered(self):
+        # پاسخ پیش‌پرواز CORS نباید مجوز بدهد؛ پس مرورگر درخواست واقعی با هدر کلید را نمی‌فرستد
+        status, headers, _ = call(self.base + "/api/start", None, method="OPTIONS",
+                                  extra_headers={"Origin": "https://evil.example",
+                                                 "Access-Control-Request-Method": "POST",
+                                                 "Access-Control-Request-Headers": "x-panel-key"})
+        self.assertNotEqual(status, 200)
+        self.assertIsNone(headers.get("Access-Control-Allow-Origin"))
+
+
+class PanelKeyConfigTests(unittest.TestCase):
+    def test_default_host_is_loopback_only(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("EXIR_PANEL_HOST", None)
+            args = web_panel.parse_args([])
+        self.assertEqual(args.host, "127.0.0.1")
+
+    def test_panel_key_from_flag_or_env_and_minimum_length(self):
+        self.assertEqual(web_panel.parse_args(["--panel-key", "k" * 20]).panel_key, "k" * 20)
+        with mock.patch.dict(os.environ, {"EXIR_PANEL_KEY": "e" * 18}):
+            self.assertEqual(web_panel.parse_args([]).panel_key, "e" * 18)
+        with self.assertRaises(SystemExit):
+            web_panel.parse_args(["--panel-key", "short"])
+
+    def test_generated_keys_are_random_and_long(self):
+        first, second = web_panel.new_panel_key(), web_panel.new_panel_key()
+        self.assertGreaterEqual(len(first), 32)
+        self.assertNotEqual(first, second)
+        self.assertEqual(web_panel.new_panel_key("x" * 16), "x" * 16)
+        with self.assertRaises(ValueError):
+            web_panel.new_panel_key("short")
 
 
 if __name__ == "__main__":
