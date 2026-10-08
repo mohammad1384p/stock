@@ -29,6 +29,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from captcha_web import CaptchaPortal, resolve_mode
+
 LOGIN_PATH = "/api/v2/login"
 # GET /captcha → image/jpeg + کوکی client_login_id (اعتبار ۱۲۰ ثانیه)
 # بقیه فقط به‌عنوان جایگزین امتحان می‌شوند. آدرس دلخواه را با --captcha-url بدهید.
@@ -43,6 +45,12 @@ CAPTCHA_CANDIDATES = (
     "/api/v1/captcha/image",
 )
 TOKEN_COOKIE = "JWT-TOKEN"
+
+
+def _yellow(s: str) -> str:
+    if sys.stdout.isatty() and os.environ.get("NO_COLOR") is None:
+        return f"\033[33m{s}\033[0m"
+    return s
 
 
 # --------------------------------------------------------------------------- #
@@ -222,9 +230,45 @@ def _mask(data):
     return data
 
 
+def obtain_captcha(portal: CaptchaPortal | None, log) -> tuple[str | None, str]:
+    """
+    کد کپچا را از مرورگر (portal) یا ترمینال می‌گیرد.
+
+    خروجی ``(code, source)``: کد، یا "" اگر کاربر کپچای جدید خواست، یا None اگر مهلت تمام شد.
+    """
+    prompt = (f"کد کپچا را وارد کنید (حداکثر {CAPTCHA_TTL} ثانیه، "
+              "Enter خالی = کپچای جدید): ")
+    if portal is None:
+        return input(prompt).strip(), "stdin"
+    if portal.stdin_ok:
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+    code, source = portal.wait_for_code(CAPTCHA_TTL)
+    if source != "stdin":
+        print()  # بستن خطِ prompt ترمینال وقتی کد از مرورگر آمد
+    if code:
+        log(f"⌨️  کد کپچا از {'مرورگر' if source == 'web' else 'ترمینال'} دریافت شد: {code}")
+    return code, source
+
+
+def _security_hint(status: int, data) -> str:
+    """توضیح خطای ۹۰۰۹ (مشکل امنیتی) برای کاربر."""
+    if status != 403:
+        return ""
+    blob = json.dumps(data, ensure_ascii=False) if not isinstance(data, str) else data
+    if "9009" not in blob and "امنیت" not in blob:
+        return ""
+    return (
+        "ℹ️  خطای ۹۰۰۹ یعنی کد کپچا/کوکی client_login_id با درخواست نمی‌خواند.\n"
+        "    اگر تصویر کپچا را در مرورگر خودتان مستقیماً از کارگزاری باز کرده‌اید، آن تصویر به\n"
+        "    نشستِ مرورگر شما گره خورده و برای لاگین از سرور معتبر نیست. تصویر باید با همان نشست\n"
+        "    سرور گرفته شود (پیش‌فرض همین است) و فقط کد آن به سرور برسد — با --captcha-web لینکش را بگیرید."
+    )
+
+
 def login(session: requests.Session, base: str, username: str, password: str, *,
           captcha_url: str | None, otp: str | None, captcha_path: Path,
-          log, max_tries: int = 3) -> dict:
+          log, portal: CaptchaPortal | None = None, max_tries: int = 3) -> dict:
     """لاگین تعاملی. خروجی: دیکشنری پاسخ سرور (شامل authToken)."""
     url = base + LOGIN_PATH
     for attempt in range(1, max_tries + 1):
@@ -232,13 +276,22 @@ def login(session: requests.Session, base: str, username: str, password: str, *,
             img = fetch_captcha(session, base, captcha_url, log)
             t_captcha = time.time()
             show_captcha(img, captcha_path, log)
-            captcha = input(f"کد کپچا را وارد کنید (حداکثر {CAPTCHA_TTL} ثانیه، Enter خالی = کپچای جدید): ").strip()
+            if portal is not None:
+                portal.set_image(img)
+                portal.announce()
+            captcha, source = obtain_captcha(portal, log)
+            if captcha is None:
+                log("⌛ مهلت کپچا (۱۲۰ ثانیه) تمام شد؛ کپچای جدید گرفته می‌شود.")
+                continue
             if not captcha:
+                log("🔄 کپچای جدید گرفته می‌شود…")
                 continue
             if time.time() - t_captcha > CAPTCHA_TTL - 3:
                 log("⌛ کپچا منقضی شد (۱۲۰ ثانیه)؛ کپچای جدید گرفته می‌شود.")
                 continue
             break
+        if portal is not None:
+            portal.set_state("submitting", "کد دریافت شد؛ در حال لاگین با نشست سرور…")
         body = {"username": username, "password": password, "captcha": captcha, "otp": otp or ""}
         headers = {
             "accept": "application/json",
@@ -255,14 +308,23 @@ def login(session: requests.Session, base: str, username: str, password: str, *,
         token = (data.get("authToken") if isinstance(data, dict) else None) or session.cookies.get(TOKEN_COOKIE)
         if r.status_code == 200 and token:
             data["authToken"] = token
+            if portal is not None:
+                portal.finish(True, "✅ ورود موفق بود؛ می‌توانید این صفحه را ببندید.")
             return data
 
         log(f"✘ لاگین ناموفق (HTTP {r.status_code}):\n{json.dumps(_mask(data), ensure_ascii=False, indent=2)}")
+        hint = _security_hint(r.status_code, data)
+        if hint:
+            log(_yellow(hint))
+        if portal is not None:
+            portal.finish(False, f"✘ لاگین ناموفق (HTTP {r.status_code}). به ترمینال سرور برگردید.")
         text = json.dumps(data, ensure_ascii=False).lower()
         if not otp and ("otp" in text or "یکبار" in text or "پیامک" in text or "دو مرحله" in text):
             otp = input("کد یکبار مصرف (OTP): ").strip()
         if attempt < max_tries:
             log(f"… تلاش دوباره ({attempt + 1}/{max_tries})")
+            if portal is not None:
+                portal.set_state("waiting", "تلاش دوباره…")
     raise RuntimeError("لاگین بعد از چند تلاش ناموفق بود.")
 
 
@@ -287,9 +349,23 @@ def ensure_token(session: requests.Session, args, log, interactive: bool) -> str
         log("🔐 ورود به حساب کاربری")
         username = args.username or input("نام کاربری: ").strip()
         password = args.password or getpass.getpass("رمز عبور (نمایش داده نمی‌شود): ")
-        data = login(session, base, username, password,
-                     captcha_url=args.captcha_url, otp=args.otp,
-                     captcha_path=Path(args.captcha_file), log=log)
+
+        # وب‌سرور موقت برای دیدن کپچا در مرورگر (سرورهای بدون نمایشگر)
+        portal: CaptchaPortal | None = None
+        want_port = resolve_mode(getattr(args, "captcha_web", None))
+        if want_port is not None:
+            portal = CaptchaPortal(log=log,
+                                   host=getattr(args, "captcha_web_host", None) or "0.0.0.0",
+                                   port=want_port, ttl=CAPTCHA_TTL)
+            if not portal.start():
+                portal = None
+        try:
+            data = login(session, base, username, password,
+                         captcha_url=args.captcha_url, otp=args.otp,
+                         captcha_path=Path(args.captcha_file), log=log, portal=portal)
+        finally:
+            if portal is not None:
+                portal.stop()
         token = data["authToken"]
         name = f"{data.get('firstName', '')} {data.get('lastName', '')}".strip()
         log(f"✔ ورود موفق{(' — ' + name) if name else ''} ({describe_token(token)})")

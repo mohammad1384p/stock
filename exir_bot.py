@@ -385,6 +385,13 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--token-file", default=os.environ.get("EXIR_TOKEN_FILE", ".exir_token.json"),
                    help="فایل ذخیره‌ی توکن")
     g.add_argument("--captcha-file", default="captcha.jpg", help="مسیر ذخیره‌ی تصویر کپچا (پسوند خودکار تنظیم می‌شود)")
+    g.add_argument("--captcha-web", nargs="?", const="auto", metavar="PORT",
+                   default=os.environ.get("EXIR_CAPTCHA_WEB"),
+                   help="تصویر کپچا را در مرورگر نشان بده و کد را از آن‌جا بگیر "
+                        "(پیش‌فرض: auto=روشن؛ عدد بدهید تا روی همان پورت بالا بیاید، off=خاموش)")
+    g.add_argument("--captcha-web-host", default=os.environ.get("EXIR_CAPTCHA_WEB_HOST", "0.0.0.0"),
+                   metavar="HOST",
+                   help="آدرسی که وب‌سرور کپچا روی آن گوش می‌دهد (127.0.0.1 = فقط خود سرور)")
     g.add_argument("--auth-mode", choices=["cookie", "bearer", "both"],
                    default=os.environ.get("EXIR_AUTH_MODE", "cookie"),
                    help="ارسال توکن به‌صورت کوکی JWT-TOKEN (مثل مرورگر)، هدر Authorization، یا هر دو")
