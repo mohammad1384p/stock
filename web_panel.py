@@ -12,23 +12,26 @@
   * ارسال را شروع/متوقف کنید و پاسخ هر درخواست را زنده ببینید.
 
 نمونه:
-    python web_panel.py                                   # پیش‌فرض: 0.0.0.0:2345
-    python web_panel.py --host 127.0.0.1                  # فقط روی خود سرور، پورت 2345
+    python web_panel.py                                   # پیش‌فرض: 127.0.0.1:2345 (فقط خود سرور)
+    python web_panel.py --host 0.0.0.0                    # روی شبکه؛ کلید پنل همچنان لازم است
     python web_panel.py --port 2345 --time-sync off        # بدون همگام‌سازی ساعت (تست)
 
-امنیت: پنل می‌تواند سفارش واقعی بفرستد و توکن/رمز را در خود دارد؛ پیش‌فرض روی
-``0.0.0.0`` بالا می‌آید تا از مرورگر همان شبکه/تونل SSH در دسترس باشد. اگر لازم
-نیست، با ``--host 127.0.0.1`` فقط روی خود سرور بایند کنید.
+امنیت: پنل می‌تواند سفارش واقعی بفرستد و توکن/رمز را در خود دارد. پیش‌فرض فقط روی
+``127.0.0.1`` بالا می‌آید. هر اجرا یک کلید دسترسی تصادفی دارد (یا ``--panel-key`` /
+``EXIR_PANEL_KEY``)؛ همه‌ی درخواست‌های API باید آن را در هدر ``X-Panel-Key`` بفرستند
+و بدون آن پاسخ ۴۰۱ است. صفحه‌ی HTML و ``/api/health`` بی‌کلید باز هستند (داده‌ی حساس ندارند).
 """
 
 from __future__ import annotations
 
 import argparse
+import hmac
 import html as html_mod
 import http.client
 import json
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -66,6 +69,25 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 TIME_RE = re.compile(r"^\s*\d{1,2}:\d{1,2}(?::\d{1,2}(?:[.,]\d{1,3})?)?\s*$")
 MAX_REQUESTS = 5000
 RUNNING_STATES = ("preparing", "syncing", "waiting", "firing")
+
+# کلید دسترسی پنل: هر درخواست API باید این هدر را داشته باشد. فرم‌ها و صفحه‌های بیرونی
+# نمی‌توانند هدر دلخواه بفرستند و درخواست‌های fetch با هدر دلخواه هم پیش‌پرواز (CORS)
+# دارند که پنل پاسخ مثبت به آن نمی‌دهد؛ پس CSRF از مرورگر شما به پنل ممکن نیست.
+PANEL_KEY_HEADER = "X-Panel-Key"
+PANEL_KEY_MIN_LEN = 16
+# مسیرهای بی‌کلید: صفحه‌ی HTML (بدون داده) و سلامت سرویس. پورتال کپچا جدا و با مسیر تصادفی
+# خودش پروکسی می‌شود (چون فرم کپچا نمی‌تواند هدر بفرستد).
+PUBLIC_PATHS = frozenset({"/", "/index.html", "/favicon.ico", "/api/health"})
+
+
+def new_panel_key(configured: str | None = None) -> str:
+    """کلید پنل: مقدار داده‌شده (حداقل ۱۶ نویسه) یا یک کلید تصادفی تازه برای همین اجرا."""
+    key = (configured or "").strip()
+    if key:
+        if len(key) < PANEL_KEY_MIN_LEN:
+            raise ValueError(f"کلید پنل باید حداقل {PANEL_KEY_MIN_LEN} نویسه باشد.")
+        return key
+    return secrets.token_urlsafe(24)
 
 
 def strip_ansi(text: str) -> str:
@@ -197,6 +219,7 @@ class PanelState:
         global STATE
         STATE = self  # تا پیام‌های داخلی ربات (panel_log) در بافر همین پنل بنشینند
         self.args = args
+        self.panel_key = new_panel_key(getattr(args, "panel_key", None))
         self.base = (args.base_url or DEFAULT_BASE_URL).rstrip("/")
         self.tz_name = args.tz or "Asia/Tehran"
         self.tz = None
@@ -843,6 +866,12 @@ def panel_handler(state: PanelState):
                 raise PanelError("بدنه‌ی درخواست باید آبجکت JSON باشد.")
             return data
 
+        def _has_panel_key(self) -> bool:
+            """مقایسه‌ی هدر X-Panel-Key با کلید پنل (بدون نشت زمانی)."""
+            want = state.panel_key or ""
+            given = self.headers.get(PANEL_KEY_HEADER) or ""
+            return bool(want) and hmac.compare_digest(given.encode("utf-8", "replace"), want.encode("utf-8"))
+
         # ---------- مسیرها ----------
         def do_GET(self) -> None:  # noqa: N802
             self._route("GET")
@@ -865,6 +894,10 @@ def panel_handler(state: PanelState):
             if portal is not None and (path.rstrip("/") == portal.base or path.startswith(portal.base + "/")):
                 return self._proxy_captcha(portal, method, parsed)
 
+            # همه‌ی مسیرهای غیرعمومی (API) فقط با کلید پنل؛ قبل از هر کاری (حتی اعتبارسنجی سفارش)
+            if path not in PUBLIC_PATHS and not self._has_panel_key():
+                return self._json({"error": "کلید پنل ارسال نشده یا نادرست است (هدر X-Panel-Key)."}, 401)
+
             if path in ("/", "/index.html"):
                 return self._html(PAGE.replace("__PORT__", str(getattr(state, "port", 0))))
             if path == "/favicon.ico":
@@ -878,7 +911,11 @@ def panel_handler(state: PanelState):
             if path == "/api/symbols":
                 return self._json(_symbols())
             if path == "/api/health":
-                return self._json({"ok": True, "version": __version__, "status": state.status})
+                # بدون کلید فقط «سالم است» را می‌گوییم؛ نسخه و وضعیت اجرا فقط برای دارنده‌ی کلید
+                body = {"ok": True}
+                if self._has_panel_key():
+                    body.update({"version": __version__, "status": state.status})
+                return self._json(body)
 
             if method != "POST":
                 return self._not_found()
@@ -1039,6 +1076,18 @@ PAGE = r"""<!doctype html>
 </header>
 
 <main>
+  <!-- ۰) کلید پنل: فقط وقتی کلید لازم است یا نادرست است نمایش داده می‌شود -->
+  <section class="card wide" id="keyBox" style="display:none">
+    <h2>🔑 کلید پنل</h2>
+    <p class="hint">هر اجرای پنل یک کلید دارد که در ترمینال سرور چاپ شده است. آدرس کامل چاپ‌شده
+      (شامل <code>#key=…</code>) را باز کنید، یا کلید را در این کادر وارد کنید.</p>
+    <div class="btns">
+      <input id="keyInput" type="password" autocomplete="off" class="mono" placeholder="کلید پنل" style="max-width:420px">
+      <button id="btnKey" class="primary">ورود به پنل</button>
+    </div>
+    <div id="keyMsg" class="msg"></div>
+  </section>
+
   <!-- ۱) سفارش -->
   <section class="card">
     <h2>۱) مشخصات سفارش</h2>
@@ -1151,6 +1200,45 @@ PAGE = r"""<!doctype html>
   var $ = function (id) { return document.getElementById(id); };
   var cursor = 0, localStamp = Date.now(), serverNow = 0, startTs = null, pollTimer = null;
   var CAPTCHA_PATH = null;
+  var KEY_STORE = "exirPanelKey";
+
+  // کلید از بخش #key=… آدرس خوانده می‌شود؛ بخش # هرگز به سرور نمی‌رود و بعدش از نوار آدرس پاک می‌شود
+  (function takeKeyFromHash() {
+    var m = /(?:^|[#&])key=([^&]+)/.exec(location.hash || "");
+    if (!m) { return; }
+    var key = m[1];
+    try { key = decodeURIComponent(key); } catch (e) { /* مقدار خام */ }
+    try { sessionStorage.setItem(KEY_STORE, key); } catch (e) { /* بی‌اثر */ }
+    history.replaceState(null, "", location.pathname + location.search);
+  })();
+
+  function panelKey() {
+    try { return sessionStorage.getItem(KEY_STORE) || ""; } catch (e) { return ""; }
+  }
+
+  // هر درخواست API با هدر کلید پنل می‌رود؛ پاسخ ۴۰۱ یعنی کلید لازم است
+  function api(path, opts) {
+    opts = opts || {};
+    var headers = {};
+    Object.keys(opts.headers || {}).forEach(function (k) { headers[k] = opts.headers[k]; });
+    headers["X-Panel-Key"] = panelKey();
+    opts.headers = headers;
+    opts.cache = opts.cache || "no-store";
+    return fetch(path, opts).then(function (r) {
+      if (r.status === 401) {
+        var err = new Error("کلید پنل نامعتبر است یا ارسال نشده.");
+        err.unauthorized = true;
+        showKeyBox("کلید پنل لازم است یا نادرست است؛ کلید را از ترمینال سرور وارد کنید.");
+        throw err;
+      }
+      return r;
+    });
+  }
+
+  function showKeyBox(msg) {
+    $("keyBox").style.display = "block";
+    if (msg) { show("keyMsg", msg, "err"); }
+  }
 
   function fmt(n) { return (n === null || n === undefined) ? "—" : Number(n).toLocaleString("fa-IR"); }
   function esc(s) { var d = document.createElement("div"); d.textContent = (s === null || s === undefined) ? "" : String(s); return d.innerHTML; }
@@ -1180,7 +1268,7 @@ PAGE = r"""<!doctype html>
   }
 
   function post(path, data) {
-    return fetch(path, {
+    return api(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data || {})
@@ -1334,16 +1422,29 @@ PAGE = r"""<!doctype html>
   }
 
   function poll() {
-    fetch("api/state?after=" + cursor, { cache: "no-store" })
+    api("api/state?after=" + cursor, { cache: "no-store" })
       .then(function (r) { return r.json(); })
       .then(function (s) {
         apply(s);
-        var fast = ["preparing", "syncing", "waiting", "firing", "idle"].indexOf(s.status) >= 0;
         var delay = (s.status === "waiting" || s.status === "firing") ? 350 : 800;
         pollTimer = setTimeout(poll, delay);
       })
-      .catch(function () { pollTimer = setTimeout(poll, 1500); });
+      .catch(function (e) {
+        if (e && e.unauthorized) { return; }   // بدون کلید معتبر صبر می‌کنیم تا کاربر کلید بدهد
+        pollTimer = setTimeout(poll, 1500);
+      });
   }
+
+  $("btnKey").addEventListener("click", function () {
+    var v = $("keyInput").value.trim();
+    if (!v) { show("keyMsg", "کلید را وارد کنید.", "err"); return; }
+    try { sessionStorage.setItem(KEY_STORE, v); } catch (e) { /* بی‌اثر */ }
+    hide("keyMsg");
+    $("keyBox").style.display = "none";
+    if (pollTimer) { clearTimeout(pollTimer); }
+    poll();
+  });
+  $("keyInput").addEventListener("keydown", function (ev) { if (ev.key === "Enter") { $("btnKey").click(); } });
 
   function onStart(nowMode) {
     hide("startMsg");
@@ -1380,7 +1481,7 @@ PAGE = r"""<!doctype html>
 
   loadForm();
   $("interval").value = $("interval").value || "305";
-  fetch("api/symbols").then(function (r) { return r.json(); }).then(function (map) {
+  api("api/symbols").then(function (r) { return r.json(); }).then(function (map) {
     var dl = $("symbolList");
     Object.keys(map || {}).forEach(function (name) {
       var opt = document.createElement("option");
@@ -1405,8 +1506,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         description="وب‌پنل ربات سفارش زمان‌دار اکسیر (فرم سفارش + لاگین/کپچا + لاگ زنده)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--host", default=os.environ.get("EXIR_PANEL_HOST", "0.0.0.0"),
-                   help="آدرس بایند وب‌سرور پنل (127.0.0.1 = فقط خود سرور)")
+    p.add_argument("--host", default=os.environ.get("EXIR_PANEL_HOST", "127.0.0.1"),
+                   help="آدرس بایند وب‌سرور پنل (127.0.0.1 = فقط خود سرور؛ 0.0.0.0 = همه‌ی کارت‌های شبکه)")
+    p.add_argument("--panel-key", default=os.environ.get("EXIR_PANEL_KEY"),
+                   help=f"کلید دسترسی پنل (حداقل {PANEL_KEY_MIN_LEN} نویسه؛ پیش‌فرض: کلید تصادفی در هر اجرا)")
     p.add_argument("--port", type=int, default=int(os.environ.get("EXIR_PANEL_PORT", "2345")),
                    help="پورت وب‌سرور پنل (0 = پورت آزاد تصادفی)")
     p.add_argument("--base-url", default=os.environ.get("EXIR_BASE_URL", DEFAULT_BASE_URL),
@@ -1438,7 +1541,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--ntp-server", action="append",
                    help="سرور NTP دلخواه (چند بار مجاز)")
     p.add_argument("--timeout", type=float, default=10.0, help="timeout هر درخواست سفارش (ثانیه)")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.panel_key and args.panel_key.strip() and len(args.panel_key.strip()) < PANEL_KEY_MIN_LEN:
+        p.error(f"--panel-key باید حداقل {PANEL_KEY_MIN_LEN} نویسه باشد.")
+    return args
 
 
 def _banner(state: PanelState, args: argparse.Namespace) -> None:
@@ -1457,13 +1563,16 @@ def _banner(state: PanelState, args: argparse.Namespace) -> None:
     panel_log(f"  توکن     : {describe_token(state.token) if state.token else 'ذخیره نشده (از پنل لاگین کنید)'}")
     if saved and saved.get("name"):
         panel_log(f"  حساب     : {saved['name']}")
-    panel_log("  آدرس پنل در مرورگر (یکی از این‌ها):")
+    panel_log("  آدرس پنل در مرورگر (یکی از این‌ها؛ کلید پنل بعد از # است):")
     for host in hosts:
-        panel_log(f"    http://{host}:{state.port}/")
+        # بخش بعد از # (fragment) هرگز به سرور فرستاده نمی‌شود و در لاگ سرور/پروکسی نمی‌افتد
+        panel_log(f"    http://{host}:{state.port}/#key={state.panel_key}")
+    panel_log(f"  کلید پنل : {state.panel_key}   (محرمانه؛ اگر آدرس بالا را باز نکردید، همین را در صفحه وارد کنید)")
     panel_log(f"  اگر سرور از راه دور است:  ssh -L {state.port}:127.0.0.1:{state.port} user@server")
     if args.host in ("0.0.0.0", "::", ""):
         panel_log("  ⚠️  پنل روی همه‌ی کارت‌های شبکه باز است و می‌تواند سفارش واقعی بفرستد؛")
-        panel_log("      اگر لازم نیست، با --host 127.0.0.1 فقط روی خود سرور بایند کنید.")
+        panel_log("      بدون کلید بالا هیچ درخواستی پذیرفته نمی‌شود، اما کلید را محرمانه نگه دارید")
+        panel_log("      و اگر لازم نیست، با --host 127.0.0.1 فقط روی خود سرور بایند کنید.")
     panel_log("═" * 52)
 
 

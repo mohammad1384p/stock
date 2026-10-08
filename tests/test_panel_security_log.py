@@ -70,9 +70,11 @@ class FakeBroker:
         self.server.server_close()
 
 
-def call(url: str, data: dict | None = None):
+def call(url: str, data: dict | None = None, key: str | None = None):
     body = json.dumps(data).encode("utf-8") if data is not None else None
     headers = {"Content-Type": "application/json"} if body else {}
+    if key:
+        headers[web_panel.PANEL_KEY_HEADER] = key
     try:
         with urlopen(UrlRequest(url, data=body, headers=headers), timeout=15) as resp:
             return resp.status, json.loads(resp.read() or b"{}")
@@ -116,13 +118,13 @@ class PanelSecurityRejectionTests(unittest.TestCase):
             "symbol": "IRO7TONP0001", "quantity": "10", "price": "6700",
             "time": "", "now": True, "dry_run": False, "duration": "1", "interval": "305",
             "time_sync": "off",
-        })
+        }, key=self.state.panel_key)
         self.assertEqual(status, 200, snap)
 
         deadline = time.time() + 25
         log_text = ""
         while time.time() < deadline:
-            _, snap = call(self.base + "/api/state?after=0")
+            _, snap = call(self.base + "/api/state?after=0", key=self.state.panel_key)
             log_text = "\n".join(entry[2] for entry in snap["logs"])
             if snap["status"] in ("error", "finished", "stopped") and snap["stats"]:
                 break
@@ -148,7 +150,7 @@ class PanelSecurityRejectionTests(unittest.TestCase):
         self.assertIn("امنیتی", first["desc"])
 
     def test_probe_plan_is_listed_without_contacting_broker(self):
-        status, snap = call(self.base + "/api/state?after=0")
+        status, snap = call(self.base + "/api/state?after=0", key=self.state.panel_key)
         self.assertEqual(status, 200)
         self.assertIn("login", snap)
         self.assertIn("token", snap)
