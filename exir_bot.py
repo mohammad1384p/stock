@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -34,8 +35,12 @@ except ImportError:  # pragma: no cover
     sys.exit(1)
 
 from timesync import clock, sync as time_sync, DEFAULT_NTP_SERVERS
-from exir_auth import (ensure_token, jwt_exp, load_saved_token, describe_token, clean_token,
-                       security_hint)
+from captcha_web import CaptchaPortal, resolve_mode
+from exir_auth import (CAPTCHA_TTL, ensure_token, jwt_exp, load_saved_token, describe_token,
+                       clean_token, security_hint)
+from session_capture import (apply_captured, browser_bootstrap, imported_token,
+                             load_captured_session, normalize_mode, parse_browser_session,
+                             save_captured_session, security_cookie_warnings)
 
 try:
     from zoneinfo import ZoneInfo
@@ -377,6 +382,157 @@ def apply_replay(session: requests.Session, headers: dict, log, *, preserve_sess
         log(f"🧩 هدرهای مرورگر اعمال شد (x-app-n = {session.headers['x-app-n']})")
 
 
+# --------------------------------------------------------------------------- #
+#  نشستِ مرورگر: import از DevTools و bootstrap رفتار مرورگر
+# --------------------------------------------------------------------------- #
+def read_import_text(source: str) -> str:
+    """متن کپی‌شده از DevTools را از فایل می‌خواند (``-`` یعنی stdin)."""
+    if source == "-":
+        return sys.stdin.read()
+    path = Path(source)
+    if not path.exists():
+        raise RuntimeError(f"فایل نشست پیدا نشد: {source}")
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def apply_import_session(session: requests.Session, args, log, text: str | None = None) -> dict:
+    """
+    «نشست مرورگر» (Copy as cURL/fetch، هدرهای خام یا رشته‌ی Cookie) را روی session می‌گذارد
+    و در فایل توکن ذخیره می‌کند تا اجراهای بعدی هم همان کوکی/هدرها را بفرستند.
+
+    اگر در کوکی‌های کپی‌شده ``JWT-TOKEN`` باشد و توکن تازه‌ای نداشته باشیم، همان توکن
+    هم ذخیره می‌شود؛ پس ورودِ مرورگرِ خودتان هم برای ربات کافی است.
+    """
+    base = args.base_url.rstrip("/")
+    raw = text if text is not None else read_import_text(args.import_session)
+    captured = parse_browser_session(raw)
+    summary = apply_captured(session, base, captured, log)
+    save_captured_session(Path(args.token_file), base, captured)
+    log(f"💾 نشستِ واردشده در {args.token_file} ذخیره شد (در اجراهای بعدی هم اعمال می‌شود).")
+
+    token = imported_token(captured)
+    if token and not getattr(args, "token", None):
+        exp = jwt_exp(token)
+        if exp is None or exp > time.time() + 60:
+            # کوکی/هدرها و توکنِ همان نشست باید با هم یکدست بمانند (x-app-n و کوکی چالش
+            # به همان ورود گره خورده‌اند)؛ پس توکنِ خودِ این نشست جایگزین توکن قبلی می‌شود.
+            from exir_auth import save_token
+            save_token(Path(args.token_file), base, token,
+                       {"appN": (captured.get("headers") or {}).get("x-app-n")})
+            log(f"🔑 توکن داخل نشستِ واردشده ذخیره شد ({describe_token(token)}) — "
+                "کوکی‌ها، هدرها و توکن از یک نشست‌اند.")
+        else:
+            log(yellow("⚠️ توکن داخل نشستِ واردشده منقضی است؛ توکن ذخیره‌شده‌ی قبلی استفاده می‌شود. "
+                       "برای نشست یکدست، دوباره از مرورگر «Copy as cURL» بگیرید."))
+    return summary
+
+
+def apply_saved_captured_session(session: requests.Session, args, log,
+                                 *, quiet: bool = False) -> dict | None:
+    """
+    نشستِ ذخیره‌شده‌ی مرورگر (از ``--import-session`` یا کادر پنل) را روی session می‌گذارد.
+
+    با ``quiet=True`` جای جزئیات، فقط یک خط خلاصه چاپ می‌شود (برای اجرای دوباره پیش از ارسال).
+    """
+    base = args.base_url.rstrip("/")
+    captured = load_captured_session(Path(args.token_file), base)
+    if not captured:
+        return None
+    summary = apply_captured(session, base, captured, None if quiet else log)
+    if quiet:
+        applied = [name for name in summary["cookies"]]
+        log(f"🧩 نشست مرورگر دوباره اعمال شد (تا پاسخ‌های سرور مقدارهای آن را بازنویسی نکنند): "
+            f"{len(applied)} کوکی [{', '.join(applied) or '—'}]")
+    return summary
+
+
+def run_bootstrap(session: requests.Session, args, log, *, budget: float | None = None,
+                  timeout: float | None = None) -> dict | None:
+    """bootstrap رفتار مرورگر (بارگذاری صفحه + تازه‌کردن کوکی کپچا) — اگر خاموش نباشد."""
+    base = args.base_url.rstrip("/")
+    mode = normalize_mode(getattr(args, "bootstrap", None))
+    if mode == "off":
+        return None
+    if timeout is None:
+        timeout = min(float(getattr(args, "timeout", 10.0) or 10.0), 10.0)
+    report = browser_bootstrap(session, base, log=log, mode=mode,
+                               captcha_url=getattr(args, "captcha_url", None),
+                               timeout=timeout, budget=budget)
+    for line in security_cookie_warnings(session, base):
+        log(yellow(line))
+    return report
+
+
+def run_browser_login(session: requests.Session, args, log) -> dict:
+    """
+    ورود با مرورگر واقعی (Playwright) روی همین سرور و ذخیره‌ی نشست آن.
+
+    این تنها راه گرفتن کوکی‌هایی است که مرورگر با اجرای جاوااسکریپت (چالش فایروال)
+    می‌گیرد؛ همان کوکی‌هایی که نبودشان باعث ۴۰۳/۹۰۰۹ می‌شود.
+    """
+    from browser_capture import capture_browser_session, captcha_provider_from_portal, session_json
+    base = args.base_url.rstrip("/")
+    probe = None
+    if getattr(args, "browser_probe", False):
+        from browser_order import probe_in_page
+        probe = lambda page: probe_in_page(page, base + ORDER_PATH,           # noqa: E731
+                                           probe_payload(args), headers=session.headers)
+    username = (getattr(args, "username", None) or "").strip() or input("نام کاربری: ").strip()
+    password = getattr(args, "password", None) or getpass.getpass("رمز عبور (نمایش داده نمی‌شود): ")
+
+    portal: CaptchaPortal | None = None
+    want_port = resolve_mode(getattr(args, "captcha_web", None))
+    if want_port is not None:
+        portal = CaptchaPortal(log=log, host=getattr(args, "captcha_web_host", None) or "0.0.0.0",
+                               port=want_port, ttl=CAPTCHA_TTL)
+        if not portal.start():
+            log("⚠️  وب‌سرور کپچا بالا نیامد؛ کد را در ترمینال وارد کنید.")
+            portal = None
+    probe_result: dict | None = None
+
+    def after_login(page) -> dict | None:
+        """داخل همان مرورگرِ لاگین‌شده یک درخواست سفارشِ نامعتبر می‌فرستد (اختیاری)."""
+        nonlocal probe_result
+        if probe is None:
+            return None
+        log(cyan("🧪 آزمایش امنیتی داخل همین مرورگر: یک POST سفارشِ عمداً نامعتبر "
+                 "(تعداد/قیمت ۰، نماد ناموجود) فرستاده می‌شود…"))
+        try:
+            probe_result = probe(page)
+        except Exception as e:  # noqa: BLE001
+            log(yellow(f"⚠️  آزمایش داخل مرورگر ناموفق بود: {e}"))
+            return None
+        status = int(probe_result.get("status") or 0)
+        body = str(probe_result.get("body") or "")
+        log(f"🧪 پاسخ مرورگر: HTTP {status or 'ERR'}  ({probe_result.get('ms', 0)}ms)\n{body[:800]}")
+        if status == 422:
+            log(green("✅ امنیت پاس شد (۴۲۲ = درخواست معتبر است، فقط بدنه‌ی سفارش نامعتبر بود). "
+                      "یعنی همین مرورگر می‌تواند سفارش بفرستد → با --browser-order اجرا کنید."))
+        elif status in (401, 403):
+            log(red("⛔ همان مرورگر هم رد شد؛ مشکل از هدر/کوکی نیست، از نشست/توکن یا سطح دسترسی "
+                    "است (توکن را روی همین سرور دوباره بگیرید)."))
+        return probe_result
+
+    try:
+        bundle = capture_browser_session(
+            base, username=username, password=password, otp=getattr(args, "otp", None) or "",
+            captcha_provider=captcha_provider_from_portal(portal, log, CAPTCHA_TTL),
+            log=log, headless=not getattr(args, "browser_show", False),
+            timeout=float(getattr(args, "browser_timeout", 90.0) or 90.0),
+            after_login=after_login,
+        )
+    finally:
+        if portal is not None:
+            portal.stop()
+    if probe_result is not None:
+        bundle["probe"] = probe_result
+    apply_import_session(session, args, log, text=session_json(bundle))
+    if bundle.get("storage"):
+        names = ", ".join(sorted(bundle["storage"].keys()))
+        log(f"ℹ️  localStorage/sessionStorage مرورگر هم گرفته شد ({names or '—'}).")
+    return bundle
+
+
 def order_hint(status: int, data) -> str:
     """توضیح خطاهای رایج ثبت سفارش."""
     hint = security_hint(status, data)
@@ -492,6 +648,7 @@ def warmup(session: requests.Session, base: str, tz) -> None:
 class Stats:
     def __init__(self):
         self.lock = threading.Lock()
+        self.planned = 0
         self.sent = 0
         self.success = 0
         self.failed = 0
@@ -590,6 +747,150 @@ def send_order(idx: int, session: requests.Session, url: str, payload: bytes,
 
 
 # --------------------------------------------------------------------------- #
+#  ارسال از داخل مرورگر واقعی (Playwright) — راه پشتیبان برای ۴۰۳/۹۰۰۹
+# --------------------------------------------------------------------------- #
+def probe_payload(args) -> bytes:
+    """
+    بدنه‌ی سفارشِ عمداً نامعتبر برای «آزمایشِ امنیتی» از داخل مرورگر: نماد ناموجود،
+    تعداد ۰ و قیمت ۰ → هیچ سفارش واقعی ثبت نمی‌شود؛ ولی اگر پاسخ `422` باشد یعنی
+    لایه‌ی امنیتی درخواست را پذیرفته است (همان نشانه‌ای که در probe_order.py هم هست).
+    """
+    from probe_order import safe_body
+    body = safe_body(0, 0)
+    return json.dumps(body, separators=(",", ":")).encode("utf-8")
+
+
+def browser_orders_available() -> bool:
+    """آیا مسیر «ارسال از داخل مرورگر واقعی» در دسترس است؟"""
+    try:
+        from browser_order import browser_available
+    except Exception:  # noqa: BLE001
+        return False
+    return browser_available()
+
+
+def browser_session_bundle(session: requests.Session, args, base: str) -> dict:
+    """
+    نشستِ مناسب برای مرورگر: کوکی/هدر/استوریجِ ذخیره‌شده (از --import-session یا
+    --browser-login) و اگر نبود، کوکی‌های نشست فعلی ربات.
+    """
+    bundle = load_captured_session(Path(args.token_file), base) or {}
+    cookies = bundle.get("cookies") or []
+    if not cookies:
+        from exir_auth import session_cookies
+        cookies = [[c["name"], c["value"]] for c in session_cookies(session, base) if c.get("name")]
+    return {"kind": bundle.get("kind") or "token", "url": bundle.get("url") or base + "/",
+            "cookies": cookies, "headers": dict(bundle.get("headers") or {}),
+            "storage": dict(bundle.get("storage") or {}),
+            "user_agent": bundle.get("user_agent") or ""}
+
+
+def record_browser_result(res: dict, *, tz, stats: Stats, log, offset_ms: int = 0,
+                          stop_on_success: bool = True) -> bool:
+    """
+    نتیجه‌ی یک درخواستِ داخل مرورگر را با همان قالب لاگ/آمارِ send_order چاپ می‌کند.
+
+    خروجی: آیا باید ارسال بقیه‌ی درخواست‌ها متوقف شود؟
+    """
+    idx = int(res.get("k") or 0)
+    status = int(res.get("status") or 0)
+    sent_ms = res.get("sent") or 0
+    got_ms = res.get("got") or sent_ms
+    sent_dt = datetime.fromtimestamp((int(sent_ms) - offset_ms) / 1000, tz)
+    got_dt = datetime.fromtimestamp((int(got_ms) - offset_ms) / 1000, tz)
+    ms = max(0, int(got_ms) - int(sent_ms))
+    text = str(res.get("body") or "")
+    try:
+        data = json.loads(text) if text.strip() else None
+        body = json.dumps(data, ensure_ascii=False, indent=2) if data is not None else (text[:2000] or "<empty>")
+    except ValueError:
+        data = None
+        body = text[:2000] or "<empty>"
+    network_error = res.get("error")
+    ok = bool(status) and is_success(status, data)
+    rejected = bool(status) and security_rejected(status, data)
+    desc = ""
+    if isinstance(data, dict):
+        desc = str(data.get("description") or data.get("message") or data.get("type") or "")
+    if network_error:
+        desc = str(network_error)
+    should_stop = False
+    with stats.lock:
+        stats.sent += 1
+        stats.success += ok
+        stats.failed += (not ok)
+        stats.results.append((idx, sent_dt.strftime("%H:%M:%S.%f")[:-3], status or None, desc or ""))
+        if rejected or (ok and stop_on_success):
+            if stats.stop_reason is None:
+                stats.stop_reason = "security" if rejected else "success"
+            should_stop = True
+    head = (f"#{idx:02d}  ارسال {sent_dt.strftime('%H:%M:%S.%f')[:-3]}  ←  دریافت "
+            f"{got_dt.strftime('%H:%M:%S.%f')[:-3]}  ({ms}ms)  HTTP {status or 'ERR'}  🌐مرورگر")
+    extra = ""
+    if not ok:
+        hint = order_hint(status, data if data is not None else body)
+        if hint:
+            extra = "\n" + yellow(hint)
+    log((green("✔ " + head) if ok else red("✘ " + head)) + "\n" + body + extra + "\n" + "─" * 60)
+    return should_stop
+
+
+def run_browser_orders(session: requests.Session, args, log, *, base: str, url: str, payload: bytes,
+                       schedule: list[float], stats: Stats, stop_evt: threading.Event, tz) -> None:
+    """سفارش‌ها را از داخل یک مرورگر واقعی (Chromium) و در زمان‌بندی دقیق می‌فرستد."""
+    from browser_order import BrowserOrders, identity_headers_from_session_url
+
+    bundle = browser_session_bundle(session, args, base)
+    headers = identity_headers_from_session_url(base, bundle, session)
+    cookie_names = sorted({str(c[0]) for c in bundle["cookies"]
+                           if isinstance(c, (list, tuple)) and c})
+    shown = [f"{k}={_short(str(v), 12)}" for k, v in sorted(headers.items())
+             if k.lower() in ("x-app-n", "clientid")]
+    log(cyan(f"🌐 ارسال از داخل مرورگر واقعی: {len(bundle['cookies'])} کوکی "
+             f"[{', '.join(cookie_names) or '—'}] | هدرهای شناسایی: {'، '.join(shown) or '—'}"))
+    if not bundle["cookies"]:
+        log(yellow("⚠️  هیچ کوکی‌ای برای مرورگر پیدا نشد؛ اول لاگین کنید (یا --browser-login)."))
+
+    orders = BrowserOrders(base, bundle=bundle, headless=not getattr(args, "browser_show", False),
+                           log=log, timeout=max(30.0, float(getattr(args, "browser_timeout", 60.0))))
+    orders.open()
+    try:
+        orders.warm()
+        times_ms = [int(round(ts * 1000)) for ts in schedule]
+        report = orders.schedule(url, payload, times_ms, headers=headers, stop_on_security=True)
+        log(cyan(f"🌐 {report.get('planned', 0)} درخواست داخل مرورگر زمان‌بندی شد "
+                 f"(اختلاف ساعت مرورگر و ساعت مرجع {report.get('offset_ms', 0):+d}ms)."))
+        offset_ms = int(report.get("offset_ms") or 0)
+        seen = 0
+        deadline = schedule[-1] + max(15.0, float(args.timeout) * 3)
+        while True:
+            if stop_evt.is_set():
+                orders.request_stop()
+            try:
+                results = sorted(orders.results(), key=lambda r: r.get("k") or 0)
+            except Exception as e:  # noqa: BLE001  (مرورگر بسته شده/صفحه عوض شده)
+                log(yellow(f"⚠️  خواندن نتیجه‌های مرورگر ناموفق بود: {e}"))
+                break
+            while seen < len(results):
+                should_stop = record_browser_result(results[seen], tz=tz, stats=stats, log=log,
+                                                    offset_ms=offset_ms,
+                                                    stop_on_success=not args.no_stop)
+                seen += 1
+                if should_stop:
+                    stop_evt.set()
+                    orders.request_stop()
+            state_info = orders.state()
+            if state_info.get("done") or seen >= len(times_ms):
+                break
+            if clock.now() > deadline:
+                log(yellow("⚠️  مهلت دریافت پاسخ‌های مرورگر تمام شد؛ بقیه در گزارش نیست."))
+                break
+            time.sleep(0.05)
+    finally:
+        orders.close()
+
+
+# --------------------------------------------------------------------------- #
 #  ورودی‌ها
 # --------------------------------------------------------------------------- #
 def ask(prompt: str, default: str | None = None) -> str:
@@ -645,6 +946,27 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--clientid", default=os.environ.get("EXIR_CLIENTID"),
                    help="مقدار هدر clientid (پیش‌فرض: مثل درخواست ورودِ مرورگر، خالی). "
                         "«off» بدهید تا این هدر اصلاً فرستاده نشود (یا EXIR_CLIENTID)")
+    g.add_argument("--bootstrap", choices=["off", "page", "captcha", "page+captcha"],
+                   default=os.environ.get("EXIR_BOOTSTRAP", "page+captcha"),
+                   help="رفتار مرورگر با همان نشست ربات پیش از ورود/ارسال: بارگذاری صفحه‌ها و/یا "
+                        "تازه‌کردن کوکی کپچا (رفع ۴۰۳/۹۰۰۹). «off» = خاموش (یا EXIR_BOOTSTRAP)")
+    g.add_argument("--import-session", metavar="FILE",
+                   help="نشست مرورگر را از خروجی DevTools (Copy as cURL / Copy as fetch / هدرهای خام) "
+                        "یا رشته‌ی Cookie بخوان؛ فایل یا «-» برای stdin. کوکی/هدرها در فایل توکن ذخیره می‌شوند")
+    g.add_argument("--browser-login", action="store_true",
+                   help="ورود با مرورگر واقعی (Playwright) روی همین سرور و ذخیره‌ی کوکی/هدرهای آن "
+                        "(قطعی‌ترین راه برای کوکی چالش فایروال)؛ نیاز به: python -m playwright install chromium")
+    g.add_argument("--browser-show", action="store_true",
+                   help="مرورگر Playwright را با پنجره اجرا کن (اگر نمایشگر دارید؛ پیش‌فرض: بی‌سر)")
+    g.add_argument("--browser-timeout", type=float, default=90.0,
+                   help="مهلت ورود/بالا آمدن مرورگر (ثانیه)")
+    g.add_argument("--browser-order", action="store_true",
+                   help="سفارش‌ها را از داخل مرورگر واقعی (Playwright) بفرست، نه با requests — "
+                        "بالاترین وفاداری به درخواست مرورگر برای دور زدن ۴۰۳/۹۰۰۹ "
+                        "(نیاز به: python -m playwright install chromium)")
+    g.add_argument("--browser-probe", action="store_true",
+                   help="با --browser-login: بعد از ورود، همان مرورگر یک درخواست سفارشِ عمداً "
+                        "نامعتبر می‌فرستد و پاسخ را چاپ می‌کند (هیچ سفارش واقعی ثبت نمی‌شود)")
     p.add_argument("-H", "--header", action="append",
                    help="هدر اضافه به شکل 'name: value' (قابل تکرار)")
     p.add_argument("--base-url", default=os.environ.get("EXIR_BASE_URL", DEFAULT_BASE_URL),
@@ -685,6 +1007,26 @@ def main() -> None:
 
     base = args.base_url.rstrip("/")
     session = build_session(args, pool=64)
+
+    # ---------- نشستِ مرورگر (کوکی/هدرهای import‌شده) + bootstrap رفتار مرورگر ----------
+    try:
+        if getattr(args, "import_session", None):
+            apply_import_session(session, args, log)
+        else:
+            apply_saved_captured_session(session, args, log)
+    except Exception as e:  # noqa: BLE001
+        log(red(f"✘ خواندن «نشست مرورگر» ناموفق بود: {e}"))
+        sys.exit(2)
+    if not args.dry_run or args.login or args.login_only:
+        run_bootstrap(session, args, log)
+
+    # ---------- ورود با مرورگر واقعی (اختیاری) ----------
+    if getattr(args, "browser_login", False):
+        try:
+            run_browser_login(session, args, log)
+        except Exception as e:  # noqa: BLE001
+            log(red(f"✘ ورود با مرورگر ناموفق بود: {e}"))
+            sys.exit(3)
 
     # ---------- لاگین / توکن ----------
     token = None
@@ -815,12 +1157,20 @@ def main() -> None:
     if delay and args.interval < int(delay):
         log(yellow(f"  ⚠️  کارگزار sendOrderDelay={delay}ms اعلام کرده؛ فاصله‌ی {args.interval}ms ممکن است خطای محدودیت بگیرد."))
     log(f"  بدنه       : {json.dumps(body, ensure_ascii=False)}")
+    log(f"  ارسال با   : {'مرورگر واقعی (Playwright)' if getattr(args, 'browser_order', False) else 'requests'}")
     for note in identity_notes(session):
         log(yellow("  " + note) if note.startswith("⚠️") else "  " + note)
     if args.dry_run:
         log(yellow("\n[dry-run] هیچ درخواستی ارسال نشد. درخواستی که فرستاده می‌شد:"))
         log(preview_request(session, "POST", url, payload))
         return
+
+    if getattr(args, "browser_order", False) and not browser_orders_available():
+        log(red("✘ ارسال با مرورگر واقعی خواسته شده، ولی Playwright نصب نیست."))
+        log("   نصب:  python -m pip install playwright  &&  python -m playwright install chromium")
+        log("   یا بدون --browser-order اجرا کنید (ارسال با requests)، یا از «Copy as cURL» + "
+            "--import-session استفاده کنید.")
+        sys.exit(2)
 
     if interactive and not args.yes:
         if input("\nادامه بدهم؟ (y/n) [y]: ").strip().lower() not in ("", "y", "yes", "بله", "ب"):
@@ -852,11 +1202,21 @@ def main() -> None:
                     last_print = time.time()
                 time.sleep(min(0.2, max(0.0, warm_ts - clock.now())))
             print()
+        # تازه‌کردن نشست/کوکی‌های چالش درست پیش از شروع (چند ثانیه مانده به ارسال)
+        run_bootstrap(session, args, log, budget=3.0, timeout=min(3.0, args.timeout))
         if clock.now() < start_ts - 0.5:
             warmup(session, base, tz)
+        # آخرین حرف را «نشست مرورگر» می‌زند: پاسخِ همان warm-up هم می‌تواند کوکی چالش را
+        # با مقدار دیگری بازنویسی کند (سرور برای درخواستِ بدونِ نشانه‌ی مرورگر مقدار تازه می‌دهد).
+        apply_saved_captured_session(session, args, log, quiet=True)
 
         # ---------- ارسال ----------
         log(bold(yellow(f"\n🚀 شروع ارسال در {target:%H:%M:%S.%f}"[:-3] + "\n")))
+        if getattr(args, "browser_order", False):
+            run_browser_orders(session, args, log, base=base, url=url, payload=payload,
+                               schedule=schedule, stats=stats, stop_evt=stop_evt, tz=tz)
+            _print_report(stats, tz)
+            return
         with ThreadPoolExecutor(max_workers=min(count, 64)) as pool:
             for k, ts in enumerate(schedule, 1):
                 if stop_evt.is_set():
@@ -874,7 +1234,11 @@ def main() -> None:
     except KeyboardInterrupt:
         log(red("\n⛔ توسط کاربر متوقف شد."))
 
-    # ---------- گزارش ----------
+    _print_report(stats, tz)
+
+
+def _print_report(stats: Stats, tz) -> None:
+    """گزارش نهایی (مشترک بین ارسال با requests و داخل مرورگر)."""
     log(bold("\n═══════════  گزارش نهایی  ═══════════"))
     log(f"  ارسال‌شده: {stats.sent}   موفق: {green(str(stats.success))}   ناموفق: {red(str(stats.failed))}")
     for idx, sent_at, status, desc in sorted(stats.results):

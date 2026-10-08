@@ -104,7 +104,11 @@ def save_token(path: Path, base: str, token: str, extra: dict | None = None) -> 
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             data = {}
-    entry = {"token": token, "saved_at": datetime.now().isoformat(timespec="seconds")}
+    # کلیدهای قبلی همان کارگزاری حفظ می‌شوند (مثلاً captured_session که با
+    # --import-session یا کادر «نشست مرورگر» پنل ذخیره شده است).
+    existing = data.get(base)
+    entry = dict(existing) if isinstance(existing, dict) else {}
+    entry.update({"token": token, "saved_at": datetime.now().isoformat(timespec="seconds")})
     entry.update(extra or {})
     data[base] = entry
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -316,14 +320,18 @@ def security_hint(status: int, data) -> str:
     if "9009" not in blob and "امنیت" not in blob:
         return ""
     return (
-        "ℹ️  خطای ۹۰۰۹ یعنی درخواست از نظر امنیتی رد شده؛ علت دقیق از این کد مشخص نیست.\n"
-        "    ورود موفق و نمایش نام حساب، معتبر بودن درخواست سفارش را تضمین نمی‌کند.\n"
-        "    کوکی‌های همراه نشست و هدر x-app-n را بین ورود و سفارش مقایسه کنید.\n"
-        "    «درخواستی که فرستاده شد» در همین لاگ (با مقادیر حساس کوتاه‌شده) چاپ شده است؛\n"
-        "    آن را با درخواست مرورگر در DevTools (Network ← Copy → Copy as fetch) مقایسه کنید.\n"
-        "    برای پیدا کردن علت با حذف فرضیه‌ها (هیچ سفارش واقعی ثبت نمی‌شود):\n"
-        "        python probe_order.py --yes\n"
-        "    و برای گزارش بدون رمز/توکن و بدون ارسال درخواست: python diagnose_session.py"
+        "ℹ️  خطای ۹۰۰۹ یعنی درخواست از نظر امنیتی رد شده؛ معمولاً چون کوکی/هدرهای نشست\n"
+        "    دقیقاً همان‌هایی نیستند که مرورگر می‌فرستد (کوکی چالش فایروال و کوکی مرحله‌ی کپچا\n"
+        "    را فقط یک مرورگر واقعی می‌گیرد). سه راه، به‌ترتیب سادگی:\n"
+        "      ۱) همان‌طور که هست دوباره اجرا کنید؛ «bootstrap» (پیش‌فرض روشن) خودش صفحه‌ها را\n"
+        "         مثل مرورگر می‌خواند و کوکی‌های نشست را تازه می‌کند.\n"
+        "      ۲) در مرورگرِ خودتان وارد کارگزاری شوید، F12 ← Network ← یک درخواست\n"
+        "         (مثلاً ورود یا دارایی) ← Copy → «Copy as cURL»، و بدهید به:\n"
+        "            python exir_bot.py --import-session browser.txt …\n"
+        "         (در پنل هم کادر «نشست مرورگر» همین کار را می‌کند.)\n"
+        "      ۳) برای پیدا کردن علت با حذف فرضیه‌ها (هیچ سفارش واقعی ثبت نمی‌شود):\n"
+        "            python probe_order.py --yes\n"
+        "    گزارش بدون رمز/توکن و بدون ارسال درخواست: python diagnose_session.py"
     )
 
 

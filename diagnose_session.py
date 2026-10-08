@@ -15,6 +15,20 @@ import requests
 from exir_auth import (TOKEN_COOKIE, apply_token, load_saved_token,
                        restore_session_cookies)
 from exir_bot import DEFAULT_BASE_URL, ORDER_PATH, build_session
+from session_capture import (BROWSER_ONLY_COOKIE_HINTS, apply_captured, load_captured_session,
+                             session_summary)
+
+
+def _browser_order_available() -> bool:
+    """آیا مسیر «ارسال از داخل مرورگر واقعی» (Playwright) در دسترس است؟"""
+    try:
+        from browser_order import browser_available
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        return bool(browser_available())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def session_report(args) -> dict:
@@ -25,6 +39,11 @@ def session_report(args) -> dict:
         restore_session_cookies(session, base, saved.get("cookies", []))
         if not session.headers.get("x-app-n") and saved.get("appN"):
             session.headers["x-app-n"] = saved["appN"]
+    captured = load_captured_session(Path(args.token_file), base)
+    if captured:
+        # کوکی/هدرهای «نشست مرورگر» که با --import-session (یا کادر پنل) ذخیره شده‌اند
+        apply_captured(session, base, captured, None)
+    if saved:
         apply_token(session, base, saved["token"], args.auth_mode)
 
     # prepare_request computes the actual Cookie header, including path, secure
@@ -36,7 +55,7 @@ def session_report(args) -> dict:
     warnings = []
     if not saved:
         warnings.append("No unexpired saved token for this broker; log in again.")
-    if saved and not saved.get("cookies"):
+    if saved and not saved.get("cookies") and not captured:
         warnings.append("Saved session has no companion cookies; a fresh login may be needed.")
     if re.fullmatch(r"NaN\.\d+", app_n):
         warnings.append("x-app-n uses the fallback NaN pattern; compare its shape with the broker browser request "
@@ -47,6 +66,11 @@ def session_report(args) -> dict:
         warnings.append("A manually configured Cookie header overrides the session cookie jar.")
     if cookie_names.count(TOKEN_COOKIE) > 1:
         warnings.append("Multiple JWT-TOKEN cookies would be sent.")
+    summary = session_summary(session, base)
+    for name in summary["missing_browser_cookies"]:
+        warnings.append(f"Cookie '{name}' (seen in the broker browser request) is not in this session: "
+                        f"{BROWSER_ONLY_COOKIE_HINTS[name]}. Import a browser request "
+                        "(--import-session, or the panel's browser-session box) or keep --bootstrap on.")
     report = {
         "offline": True,
         "requests_sent": 0,
@@ -64,11 +88,20 @@ def session_report(args) -> dict:
                     "matches_saved": bool(saved and app_n and app_n == saved.get("appN"))},
         "header_names": sorted(prepared.headers.keys(), key=str.lower),
         "cookie_names_sent": cookie_names,
+        "captured_session": ({"source": captured.get("kind", "?"),
+                              "cookies": [str(n) for n, _ in (captured.get("cookies") or [])],
+                              "headers": sorted(str(k) for k in (captured.get("headers") or {}).keys())}
+                             if captured else None),
+        "missing_browser_cookies": summary["missing_browser_cookies"],
+        "browser_order_available": _browser_order_available(),
         "cookies": [{"name": c.name, "domain": c.domain, "path": c.path,
                      "secure": c.secure, "expires": c.expires}
                     for c in session.cookies],
         "warnings": warnings,
         "note": "Cookie/token/header VALUES and account details are not included. "
+                "If security cookies are missing (or 403/9009 persists), run with "
+                "browser_order_available=true (python exir_bot.py --browser-order) or import a "
+                "real browser session (--import-session / the panel's browser-session box). "
                 "This checks local request preparation, not broker acceptance. "
                 "CLI/env overrides must match the running panel.",
     }

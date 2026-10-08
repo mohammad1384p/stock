@@ -21,7 +21,13 @@
     python probe_order.py --yes --only current --only no-clientid
     python probe_order.py --yes --app-n-candidate "2018887747744.29964494"
     python probe_order.py --yes --clientid-candidate "<مقدار مرورگر>"
+    python probe_order.py --yes --import-session browser.txt   # با نشست مرورگر خودتان
     python probe_order.py --yes --json probe.json     # گزارش برای اشتراک‌گذاری
+
+دو دسته واریانتِ کلیدی:
+  * `bootstrap-*` — رفتار مرورگر (بارگذاری صفحه/تازه‌کردن کوکی کپچا) با همان نشست ربات.
+  * `imported-session` — با `--import-session <فایل Copy as cURL>` کوکی چالش فایروال و
+    `x-app-n` واقعی مرورگر روی نشست گذاشته می‌شود (قوی‌ترین آزمون).
 """
 
 from __future__ import annotations
@@ -44,7 +50,10 @@ except ImportError:  # pragma: no cover
 
 from exir_auth import (apply_token, clean_token, describe_token, jwt_exp, load_saved_token,
                        restore_session_cookies)
-from exir_bot import DEFAULT_BASE_URL, ORDER_PATH, build_session, format_request
+from exir_bot import (DEFAULT_BASE_URL, ORDER_PATH, build_session, format_request,
+                      read_import_text)
+from session_capture import (apply_captured, browser_bootstrap, host_is_same_site, normalize_mode,
+                             parse_browser_session)
 
 # بدنه‌ی «سالم ولی نامعتبر»: قالبِ ISIN درست است ولی چنین نمادی وجود ندارد و
 # تعداد/قیمت صفر است؛ چنین سفارشی در هیچ بازاری قابل ثبت نیست.
@@ -155,6 +164,28 @@ def build_variants(args, base: str) -> list[Variant]:
     def drop_header(session, name):
         session.headers.pop(name, None)
 
+    bootstrap_mode = normalize_mode(getattr(args, "bootstrap", None))
+
+    def boot(mode: str):
+        """bootstrap رفتار مرورگر روی همان نشستِ واریانت (بدون چاپ پیام)."""
+        def hook(session):
+            browser_bootstrap(session, base, log=None, mode=mode,
+                              captcha_url=getattr(args, "captcha_url", None), budget=8.0)
+        return hook
+
+    def import_session(session):
+        text = read_import_text(args.import_session)
+        apply_captured(session, base, parse_browser_session(text), None)
+
+    def xsrf_header(session):
+        """اگر کوکی ضد-CSRF وجود دارد، هدر معادلش را هم می‌فرستد (قرارداد Angular/Spring)."""
+        for cookie in list(session.cookies):
+            low = cookie.name.lower()
+            if low in ("xsrf-token", "csrf-token", "csrftoken"):
+                session.headers["X-XSRF-TOKEN"] = cookie.value
+                session.headers["X-CSRF-TOKEN"] = cookie.value
+                break
+
     def digits_app_n(session):
         set_header(session, "x-app-n", f"{random.randint(10**12, 10**13 - 1)}.{random.randint(10**7, 10**8 - 1)}")
 
@@ -167,8 +198,25 @@ def build_variants(args, base: str) -> list[Variant]:
 
     variants = [
         Variant("current",
-                "همان درخواستی که ربات الان می‌فرستد (خط پایه)",
-                mutate=None),
+                "همان درخواستی که ربات الان می‌فرستد (خط پایه"
+                + ("، شامل bootstrap رفتار مرورگر)" if bootstrap_mode != "off" else ")"),
+                mutate=None,
+                pre=boot(bootstrap_mode) if bootstrap_mode != "off" else None),
+        Variant("no-bootstrap",
+                "بدون bootstrap (رفتار نسخه‌های قبلی ربات: هیچ صفحه‌ای خوانده نمی‌شود)",
+                "با  --bootstrap off  اجرا کنید" if bootstrap_mode != "off" else ""),
+        Variant("bootstrap-page",
+                "اول صفحه‌های کارگزاری مثل مرورگر خوانده می‌شوند (بدون تازه‌کردن کپچا)",
+                "در ربات:  --bootstrap page",
+                pre=boot("page")),
+        Variant("bootstrap-captcha",
+                "کوکی مرحله‌ی کپچا با همان نشست تازه می‌شود (GET /captcha)",
+                "در ربات:  --bootstrap captcha",
+                pre=boot("captcha")),
+        Variant("xsrf-header",
+                "کوکی ضد-CSRF (اگر باشد) در هدر X-XSRF-TOKEN هم فرستاده می‌شود",
+                "برای ربات: مقدار کوکی را از مرورگر بگیرید و با -H 'X-XSRF-TOKEN: …' بدهید",
+                mutate=xsrf_header),
         Variant("no-clientid",
                 "هدر clientid حذف می‌شود (وضعیت نسخه‌های قبلی ربات)",
                 "بات را با  --clientid off  اجرا کنید",
@@ -212,6 +260,12 @@ def build_variants(args, base: str) -> list[Variant]:
                                    "clientid با مقدار واقعیِ دیده‌شده در مرورگر فرستاده می‌شود",
                                    f"--clientid \"{args.clientid_candidate}\"",
                                    mutate=lambda s: set_header(s, "clientid", args.clientid_candidate)))
+    if getattr(args, "import_session", None):
+        variants.insert(1, Variant("imported-session",
+                                   "کوکی/هدرهای «Copy as cURL» مرورگر روی نشست اعمال می‌شوند "
+                                   "(کوکی چالش فایروال و x-app-n واقعی)",
+                                   "در ربات:  --import-session <فایل>",
+                                   pre=import_session))
     return variants
 
 
@@ -337,6 +391,8 @@ def print_report(results: list[Result], args) -> list[Result]:
     if not good:
         print(yellow("  ⚠️  هیچ واریانتی از لایه‌ی امنیت رد نشد. یعنی مشکل در همین چند هدر/کوکی نیست؛"))
         print(yellow("      نشست را با --login تازه کنید (روی همان سرور و همان IP) و اگر باز هم ۹۰۰۹ بود،"))
+        print(yellow("      «Copy as cURL» یک درخواست مرورگرِ واردشده را بگیرید و با همان اجرا کنید:"))
+        print(cyan("        python probe_order.py --yes --import-session browser.txt"))
         print(yellow("      «درخواست مرورگر» را از DevTools (Copy as fetch) بگیرید و با این ابزار مقایسه کنید:"))
         print(cyan("        python compare_request.py browser.txt -s <نماد> -q <تعداد> -p <قیمت>"))
         print(cyan("      و اگر لازم شد همان اسنیپت را با --body-file بازپخش کنید."))
@@ -377,6 +433,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--clientid-candidate", metavar="VALUE",
                    help="مقدار clientid دیده‌شده در درخواست مرورگر (برای یک واریانت)")
     p.add_argument("--cookie", default=os.environ.get("EXIR_COOKIE"), help="کوکی‌های اضافه: 'a=1; b=2'")
+    p.add_argument("--bootstrap", choices=["off", "page", "captcha", "page+captcha"],
+                   default=os.environ.get("EXIR_BOOTSTRAP", "page+captcha"),
+                   help="bootstrap رفتار مرورگر برای واریانت «current» (پیش‌فرض همان ربات: page+captcha)")
+    p.add_argument("--import-session", metavar="FILE",
+                   help="فایل خروجی «Copy as cURL» مرورگر (یا - برای stdin)؛ یک واریانت با همان "
+                        "کوکی/هدرهای مرورگر اجرا می‌شود")
+    p.add_argument("--captcha-url", default=os.environ.get("EXIR_CAPTCHA_URL"),
+                   help="آدرس کپچا برای تازه‌کردن کوکی (پیش‌فرض /captcha)")
     p.add_argument("-H", "--header", action="append", help="هدر اضافه به شکل 'name: value'")
     p.add_argument("--body-file", help="بدنه‌ی JSON دلخواه (تعداد/قیمت با پرچم زیر صفر می‌شود)")
     p.add_argument("--allow-real-body", action="store_true",

@@ -1,2 +1,5 @@
 requests>=2.28
 tzdata; sys_platform == "win32"   # برای Asia/Tehran در ویندوز
+
+# اختیاری: ورود با مرورگر واقعی (کوکی‌های چالش فایروال) — نیاز به نصب جداگانه دارد:
+#   python -m pip install playwright && python -m playwright install chromium

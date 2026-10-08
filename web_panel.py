@@ -58,9 +58,11 @@ from captcha_web import CaptchaPortal, local_ip
 from exir_auth import (CAPTCHA_TTL, apply_token, clean_token, describe_token, jwt_exp,
                        load_saved_token, login, restore_session_cookies, save_token,
                        session_cookies)
-from exir_bot import (DEFAULT_BASE_URL, ORDER_PATH, Stats, apply_replay, build_session,
-                      parse_fetch_snippet, parse_target_time, resolve_isin, send_order,
-                      stop_message, wait_until, warmup)
+from exir_bot import (DEFAULT_BASE_URL, ORDER_PATH, Stats, apply_import_session, apply_replay,
+                      apply_saved_captured_session, browser_orders_available, build_session,
+                      parse_fetch_snippet, parse_target_time, resolve_isin, run_bootstrap,
+                      run_browser_orders, send_order, stop_message, wait_until, warmup)
+from session_capture import (load_captured_session, normalize_mode, session_summary)
 from timesync import clock, sync as time_sync
 
 __version__ = "1.0"
@@ -206,6 +208,10 @@ def validate_run_request(data: dict) -> dict:
         "dry_run": bool(data.get("dry_run")),
         "time_sync": mode,
         "body": str(data.get("body") or "").strip(),
+        # bootstrap رفتار مرورگر (بارگذاری صفحه + تازه‌کردن کوکی کپچا) پیش از ارسال
+        "bootstrap": data.get("bootstrap", True) not in (False, "false", "0", "off", "", None),
+        # ارسال از داخل مرورگر واقعی (Playwright) — راه پشتیبان برای ۴۰۳/۹۰۰۹
+        "browser_order": data.get("browser_order", False) not in (False, "false", "0", "off", "", None),
     }
 
 
@@ -247,8 +253,10 @@ class PanelState:
         self.token: str | None = None
         self.token_desc = "—"
         self.token_exp: float | None = None
+        self.session_info: dict | None = None   # خلاصه‌ی «نشست مرورگر» (فقط نام‌ها)
         self.started_at = time.time()
         self.refresh_token()
+        self.refresh_session_info()
 
     # ---------------- لاگ ----------------
     def add_log(self, text: str) -> None:
@@ -294,6 +302,37 @@ class PanelState:
             self.token_exp = jwt_exp(token) if token else None
             self.token_desc = describe_token(token) if token else "توکن ذخیره‌شده‌ای نیست"
 
+    def refresh_session_info(self) -> None:
+        """خلاصه‌ی نشستِ مرورگرِ ذخیره‌شده در فایل توکن (فقط نام کوکی/هدرها)."""
+        captured = load_captured_session(Path(self.args.token_file), self.base)
+        info = None
+        if captured:
+            info = {
+                "source": captured.get("kind", "?"),
+                "cookies": [str(name) for name, _ in (captured.get("cookies") or [])][:24],
+                "headers": sorted(str(k) for k in (captured.get("headers") or {}).keys())[:24],
+            }
+        with self.lock:
+            self.session_info = info
+
+    def import_session(self, text: str) -> dict:
+        """«نشست مرورگر» را از متن DevTools می‌گیرد و در فایل توکن ذخیره می‌کند."""
+        if not (text or "").strip():
+            raise PanelError("متنی برای «نشست مرورگر» داده نشد (Copy as cURL یا رشته‌ی Cookie).")
+        cfg = _base_cfg(self)
+        session = build_session(cfg, 4)
+        try:
+            applied = apply_import_session(session, cfg, panel_log, text=text)
+            summary = session_summary(session, self.base)
+        finally:
+            session.close()
+        self.refresh_token()
+        with self.lock:
+            self.session_info = {"source": applied.get("kind", "?"), "cookies": summary["cookie_names"],
+                                 "headers": sorted(applied.get("headers", []))}
+            info = dict(self.session_info)
+        return {"ok": True, "applied": applied, "session": info}
+
     def forget_token(self) -> bool:
         path = Path(self.args.token_file)
         removed = False
@@ -307,6 +346,7 @@ class PanelState:
             self.token = None
             self.token_exp = None
             self.token_desc = "توکن ذخیره‌شده‌ای نیست"
+            self.session_info = None
         return removed
 
     # ---------------- اجرا ----------------
@@ -349,7 +389,7 @@ class PanelState:
             self.sync_busy = True
         threading.Thread(target=_worker_sync, args=(self,), name="exir-sync", daemon=True).start()
 
-    def start_login(self, username: str, password: str, otp: str = "") -> None:
+    def start_login(self, username: str, password: str, otp: str = "", *, browser: bool = False) -> None:
         if not username.strip() or not password:
             raise PanelError("نام کاربری و رمز عبور را وارد کنید.")
         with self.lock:
@@ -357,9 +397,10 @@ class PanelState:
                 raise PanelError("یک ورود همین حالا در جریان است.")
             self.login_busy = True
             self.login_state = "starting"
-            self.login_message = "شروع ورود…"
-        threading.Thread(target=_worker_login, args=(self, username.strip(), password, otp.strip()),
-                         name="exir-login", daemon=True).start()
+            self.login_message = "شروع ورود با مرورگر واقعی…" if browser else "شروع ورود…"
+        worker = _worker_browser_login if browser else _worker_login
+        threading.Thread(target=worker, args=(self, username.strip(), password, otp.strip()),
+                         name="exir-browser-login" if browser else "exir-login", daemon=True).start()
 
     def shutdown(self) -> None:
         with self.lock:
@@ -418,6 +459,7 @@ class PanelState:
                     "desc": self.token_desc,
                     "exp": self.token_exp,
                 },
+                "session": self.session_info,
                 "login": {
                     "busy": self.login_busy,
                     "state": self.login_state,
@@ -455,6 +497,7 @@ def _base_cfg(state: PanelState) -> SimpleNamespace:
         username=getattr(args, "username", None),
         timeout=getattr(args, "timeout", 10.0),
         tz=state.tz_name,
+        bootstrap=normalize_mode(getattr(args, "bootstrap", None)),
     )
 
 
@@ -471,6 +514,11 @@ def _run_cfg(state: PanelState, req: dict) -> SimpleNamespace:
     cfg.dry_run = req["dry_run"]
     cfg.time_sync = req["time_sync"] or _default_time_sync(state.args)
     cfg.ntp_server = getattr(state.args, "ntp_server", None)
+    # چک‌باکس «bootstrap نشست» در فرم، از تنظیم خط فرمان اولویت دارد
+    cfg.bootstrap = "page+captcha" if req.get("bootstrap", True) else "off"
+    cfg.browser_order = bool(req.get("browser_order"))
+    cfg.browser_show = bool(getattr(state.args, "browser_show", False))
+    cfg.browser_timeout = float(getattr(state.args, "browser_timeout", 90.0) or 90.0)
     return cfg
 
 
@@ -620,13 +668,23 @@ def _fire(state: PanelState, cfg: SimpleNamespace, session, base: str, stop_evt:
 
     if stop_evt.is_set():
         raise Stopped("پیش از شروع لغو شد؛ هیچ درخواستی ارسال نشد.")
+    # تازه‌کردن کوکی‌های نشست/چالش درست چند ثانیه پیش از ارسال (اگر انتظار طولانی بوده)
+    run_bootstrap(session, cfg, panel_log, budget=3.0, timeout=min(3.0, float(cfg.timeout or 3.0)))
     if clock.now() < start_ts - 0.5:
         warmup(session, base, tz)
+    # مقدارهای «نشست مرورگر» آخرین حرف را می‌زنند (پاسخ warm-up/سرور آن‌ها را بازنویسی می‌کند)
+    apply_saved_captured_session(session, cfg, panel_log, quiet=True)
 
     with state.lock:
         state.start_ts = None
     state.set_status("firing", f"در حال ارسال {count} درخواست…")
-    panel_log(f"🚀 شروع ارسال در {fmt_ms(target)}")
+    panel_log(f"🚀 شروع ارسال در {fmt_ms(target)}"
+              + ("  (داخل مرورگر واقعی 🌐)" if getattr(cfg, "browser_order", False) else ""))
+    if getattr(cfg, "browser_order", False):
+        run_browser_orders(session, cfg, panel_log, base=base, url=url, payload=payload,
+                           schedule=schedule, stats=stats, stop_evt=stop_evt, tz=tz)
+        _report_run_finish(state, cfg, stats, stop_evt)
+        return
     with ThreadPoolExecutor(max_workers=min(count, 64)) as pool:
         for k, ts in enumerate(schedule, 1):
             if stop_evt.is_set():
@@ -642,6 +700,12 @@ def _fire(state: PanelState, cfg: SimpleNamespace, session, base: str, stop_evt:
                         stats, stop_evt, not cfg.no_stop)
         panel_log("… منتظر دریافت پاسخ درخواست‌های در جریان")
 
+    _report_run_finish(state, cfg, stats, stop_evt)
+
+
+def _report_run_finish(state: PanelState, cfg: SimpleNamespace, stats: Stats,
+                       stop_evt: threading.Event) -> None:
+    """گزارش/وضعیت پایان اجرا (مشترک بین ارسال با requests و داخل مرورگر)."""
     with stats.lock:
         sent, ok, failed = stats.sent, stats.success, stats.failed
     panel_log(f"📊 گزارش نهایی — ارسال‌شده: {sent} | موفق: {ok} | ناموفق: {failed}")
@@ -672,6 +736,10 @@ def _worker_run(state: PanelState, req: dict) -> None:
 
         session = build_session(cfg, 64)
         token = _load_token_into(session, cfg, base)
+        # کوکی/هدرهای «نشست مرورگر» (import‌شده) + bootstrap رفتار مرورگر پیش از ارسال
+        apply_saved_captured_session(session, cfg, panel_log)
+        run_bootstrap(session, cfg, panel_log, budget=8.0)
+        state.session_info = session_summary(session, base)
         state.refresh_token()
         if not token and not cfg.dry_run:
             raise PanelError("توکن معتبری موجود نیست؛ از بخش «ورود / توکن» لاگین کنید.")
@@ -679,6 +747,10 @@ def _worker_run(state: PanelState, req: dict) -> None:
             exp = jwt_exp(token)
             if exp and exp < clock.now():
                 raise PanelError("توکن ذخیره‌شده منقضی شده است؛ دوباره لاگین کنید.")
+        if getattr(cfg, "browser_order", False) and not browser_orders_available():
+            raise PanelError("Playwright نصب نیست؛ برای «ارسال از داخل مرورگر واقعی» روی سرور اجرا کنید: "
+                             "python -m pip install playwright  &&  python -m playwright install chromium "
+                             "(یا تیک آن را بردارید و با bootstrap/نشست مرورگر ادامه دهید).")
         _fire(state, cfg, session, base, my_evt, stats)
     except Stopped as e:
         state.set_status("stopped", str(e) or "اجرا متوقف شد.")
@@ -733,6 +805,62 @@ def _stop_portal_later(portal: CaptchaPortal, state: PanelState, delay: float) -
     threading.Thread(target=_run, name="captcha-portal-stop", daemon=True).start()
 
 
+def _worker_browser_login(state: PanelState, username: str, password: str, otp: str) -> None:
+    """ورود با مرورگر واقعی (Playwright) و ذخیره‌ی کوکی/هدرهای آن — رفع قطعی خالی‌بودن کوکی چالش."""
+    base = state.base
+    portal: CaptchaPortal | None = None
+    try:
+        from browser_capture import (capture_browser_session, captcha_provider_from_portal,
+                                     playwright_available, session_json)
+        if not playwright_available():
+            raise PanelError("Playwright نصب نیست. روی سرور اجرا کنید: "
+                             "python -m pip install playwright && python -m playwright install chromium "
+                             "(یا از مرورگر خودتان «Copy as cURL» بگیرید و در کادر «نشست مرورگر» بچسبانید).")
+        cfg = _base_cfg(state)
+        session = build_session(cfg, 8)
+        run_bootstrap(session, cfg, panel_log, budget=5.0)
+
+        portal = CaptchaPortal(log=panel_log, host="127.0.0.1", port=0, ttl=CAPTCHA_TTL)
+        if portal.start():
+            with state.lock:
+                state.portal = portal
+            panel_log("🌐 مرورگر واقعی در حال بالا آمدن است؛ کد کپچا را در همین صفحه بفرستید.")
+        else:
+            portal = None
+            panel_log("⚠️  صفحه‌ی کپچا بالا نیامد؛ کد را در ترمینال سرور وارد کنید.")
+        state.set_login("captcha" if portal is not None else "starting",
+                        "منتظر کد کپچا (ورود با مرورگر)…" if portal is not None else "منتظر ورودی ترمینال…")
+
+        bundle = capture_browser_session(
+            base, username=username, password=password, otp=otp or "",
+            captcha_provider=captcha_provider_from_portal(portal, panel_log, CAPTCHA_TTL),
+            log=panel_log, headless=True,
+            timeout=float(getattr(state.args, "browser_timeout", 120.0) or 120.0),
+        )
+        apply_import_session(session, cfg, panel_log, text=session_json(bundle))
+        state.refresh_token()
+        with state.lock:
+            state.session_info = {"source": "browser",
+                                  "cookies": [str(n) for n, _ in bundle.get("cookies", [])][:24],
+                                  "headers": sorted(str(h) for h in (bundle.get("headers") or {}).keys())[:24]}
+        with state.lock:
+            token = state.token
+        state.set_login("ok", "ورود با مرورگر موفق بود" +
+                        (f" ({describe_token(token)})" if token else "") + "؛ نشست ذخیره شد.")
+        panel_log("✔ نشست مرورگر ذخیره شد؛ از این پس سفارش‌ها با همان کوکی/هدرها می‌روند.")
+    except PanelError as e:
+        state.set_login("error", f"ورود با مرورگر ناموفق: {e}")
+        panel_log(f"✘ {e}")
+    except Exception as e:  # noqa: BLE001
+        state.set_login("error", f"ورود با مرورگر ناموفق: {e}")
+        panel_log(f"✘ ورود با مرورگر ناموفق: {e}")
+    finally:
+        with state.lock:
+            state.login_busy = False
+        if portal is not None:
+            _stop_portal_later(portal, state, 20)
+
+
 def _worker_login(state: PanelState, username: str, password: str, otp: str) -> None:
     base = state.base
     portal: CaptchaPortal | None = None
@@ -740,6 +868,11 @@ def _worker_login(state: PanelState, username: str, password: str, otp: str) -> 
     try:
         cfg = _base_cfg(state)
         session = build_session(cfg, 8)
+        # نشستِ مرورگر (اگر قبلاً import شده) + bootstrap: تا کپچا/کوکی چالش با همان
+        # نشستی گرفته شود که لاگین می‌رود (وگرنه ورود می‌تواند ۹۰۰۹ بگیرد).
+        apply_saved_captured_session(session, cfg, panel_log)
+        run_bootstrap(session, cfg, panel_log, budget=5.0)
+        state.session_info = session_summary(session, base)
         portal = CaptchaPortal(log=panel_log, host="127.0.0.1", port=0, ttl=CAPTCHA_TTL)
         if portal.start():
             with state.lock:
@@ -932,6 +1065,15 @@ def panel_handler(state: PanelState):
                     state.start_login(str(data.get("username") or ""), str(data.get("password") or ""),
                                       str(data.get("otp") or ""))
                     self._json({"ok": True, "message": "ورود آغاز شد."})
+                elif path == "/api/browser-login":
+                    data = self._read_json()
+                    state.start_login(str(data.get("username") or ""), str(data.get("password") or ""),
+                                      str(data.get("otp") or ""), browser=True)
+                    self._json({"ok": True, "message": "ورود با مرورگر آغاز شد."})
+                elif path == "/api/import-session":
+                    data = self._read_json()
+                    result = state.import_session(str(data.get("text") or ""))
+                    self._json(result)
                 elif path == "/api/forget-token":
                     removed = state.forget_token()
                     panel_log("🗑 توکن ذخیره‌شده پاک شد." if removed else "ℹ️  فایل توکنی برای پاک‌کردن نبود.")
@@ -1126,6 +1268,8 @@ PAGE = r"""<!doctype html>
     <div class="btns">
       <label class="check"><input type="checkbox" id="stopOnSuccess" checked> توقف پس از اولین موفقیت</label>
       <label class="check"><input type="checkbox" id="dryRun"> اجرای آزمایشی (بدون ارسال)</label>
+      <label class="check"><input type="checkbox" id="bootstrapOn" checked title="پیش از ارسال، صفحه‌ها مثل مرورگر خوانده و کوکی‌های نشست/کپچا تازه می‌شوند"> bootstrap نشست (رفتار مرورگر)</label>
+      <label class="check"><input type="checkbox" id="browserOrder" title="سفارش‌ها را از داخل یک مرورگر واقعی (Chromium) می‌فرستد؛ کندتر ولی باوفاترین حالت به مرورگر — رفع ۴۰۳/۹۰۰۹"> ارسال از داخل مرورگر واقعی 🌐 (نیاز به Playwright)</label>
     </div>
     <div class="btns">
       <button id="btnStart" class="primary">⏱ زمان‌بندی و شروع</button>
@@ -1151,6 +1295,7 @@ PAGE = r"""<!doctype html>
     </div>
     <div class="btns">
       <button id="btnLogin" class="primary">🔐 ورود و ذخیره‌ی توکن</button>
+      <button id="btnBrowserLogin" title="مرورگر واقعی روی همین سرور بالا می‌آید و کوکی چالش فایروال را می‌گیرد (نیاز به Playwright)">🌐 ورود با مرورگر واقعی</button>
       <button id="btnForget">🗑 پاک‌کردن توکن ذخیره‌شده</button>
     </div>
     <div id="loginMsg" class="msg"></div>
@@ -1163,6 +1308,19 @@ PAGE = r"""<!doctype html>
       تصویر کپچا با نشست همین سرور گرفته می‌شود (نه مرورگر شما) و از پنل نمایش داده می‌شود؛
       توکن در <code>.exir_token.json</code> ذخیره و تا زمان انقضا استفاده می‌شود.
     </div>
+    <hr style="border:0;border-top:1px solid var(--line);margin:14px 0">
+    <div class="hint" style="margin-top:0">
+      <b>نشست مرورگر</b> (اختیاری، برای رفع «مشکل امنیتی/۹۰۰۹»): در مرورگرِ خودتان وارد کارگزاری شوید،
+      F12 ← Network ← یک درخواست ← راست‌کلیک ← «Copy as cURL» و این‌جا بچسبانید. کوکی‌ها و هدرهای
+      شناسایی (مثل <code>x-app-n</code>) همان‌طور که مرورگر می‌فرستد، ذخیره و در سفارش‌ها استفاده می‌شوند.
+      <div id="sessionLine" style="margin-top:6px">نشست واردشده: —</div>
+    </div>
+    <textarea id="sessionText" placeholder="curl 'https://...' -H 'cookie: ...' … یا  Cookie: a=1; b=2"
+              style="min-height:90px"></textarea>
+    <div class="btns">
+      <button id="btnImport">📥 ذخیره‌ی نشست مرورگر</button>
+    </div>
+    <div id="sessionMsg" class="msg"></div>
   </section>
 
   <!-- ۳) وضعیت -->
@@ -1262,6 +1420,8 @@ PAGE = r"""<!doctype html>
       time_sync: $("timeSync").value,
       no_stop: !$("stopOnSuccess").checked,
       dry_run: $("dryRun").checked,
+      bootstrap: $("bootstrapOn").checked,
+      browser_order: $("browserOrder").checked,
       now: !!nowMode,
       body: $("body").value.trim()
     };
@@ -1284,6 +1444,8 @@ PAGE = r"""<!doctype html>
       var obj = {};
       keys.forEach(function (k) { obj[k] = $(k).value; });
       obj.stopOnSuccess = $("stopOnSuccess").checked;
+      obj.bootstrapOn = $("bootstrapOn").checked;
+      obj.browserOrder = $("browserOrder").checked;
       localStorage.setItem("exirPanelForm", JSON.stringify(obj));
     } catch (e) {}
   }
@@ -1292,7 +1454,9 @@ PAGE = r"""<!doctype html>
       var obj = JSON.parse(localStorage.getItem("exirPanelForm") || "null");
       if (!obj) { return; }
       Object.keys(obj).forEach(function (k) {
-        if (k === "stopOnSuccess") { $("stopOnSuccess").checked = !!obj[k]; }
+        if (k === "stopOnSuccess" || k === "bootstrapOn" || k === "browserOrder") {
+          if ($(k)) { $(k).checked = !!obj[k]; }
+        }
         else if ($(k)) { $(k).value = obj[k]; }
       });
     } catch (e) {}
@@ -1385,6 +1549,14 @@ PAGE = r"""<!doctype html>
     $("clockChip").textContent = "ساعت: " + s.server_time + " | " + (c.source || "—") + acc;
     $("tokenChip").textContent = "توکن: " + ((s.token && s.token.present) ? s.token.desc : "ندارد");
     $("baseChip").textContent = s.base || "";
+    var sess = s.session;
+    var line = "نشست واردشده: —";
+    if (sess) {
+      var cookies = (sess.cookies || []).length;
+      line = "نشست واردشده (" + (sess.source || "?") + "): " + fmt(cookies) + " کوکی"
+             + ((sess.cookies || []).length ? " [" + esc(sess.cookies.join(", ")) + "]" : "");
+    }
+    $("sessionLine").innerHTML = line;
   }
 
   function tickCountdown() {
@@ -1469,15 +1641,36 @@ PAGE = r"""<!doctype html>
       .then(function () { show("loginMsg", "ورود آغاز شد؛ کد کپچا را در کادر پایین بفرستید.", "info"); })
       .catch(function (e) { show("loginMsg", "✘ " + e.message, "err"); });
   });
+  $("btnBrowserLogin").addEventListener("click", function () {
+    hide("loginMsg");
+    post("api/browser-login", { username: $("username").value.trim(), password: $("password").value, otp: $("otp").value.trim() })
+      .then(function () { show("loginMsg", "مرورگر واقعی روی سرور بالا می‌آید؛ کد کپچا را در کادر پایین بفرستید.", "info"); })
+      .catch(function (e) { show("loginMsg", "✘ " + e.message, "err"); });
+  });
   $("btnForget").addEventListener("click", function () {
     if (!confirm("فایل توکن ذخیره‌شده پاک شود؟")) { return; }
     post("api/forget-token").then(function (r) { show("loginMsg", r.removed ? "توکن پاک شد." : "فایلی برای پاک‌کردن نبود.", "info"); })
       .catch(function (e) { show("loginMsg", "✘ " + e.message, "err"); });
   });
   $("btnClear").addEventListener("click", function () { post("api/clear-log").then(function () { $("console").innerHTML = ""; }); });
+  $("btnImport").addEventListener("click", function () {
+    hide("sessionMsg");
+    var text = $("sessionText").value.trim();
+    if (!text) { show("sessionMsg", "متن «Copy as cURL» یا رشته‌ی Cookie را بچسبانید.", "err"); return; }
+    post("api/import-session", { text: text })
+      .then(function (r) {
+        var sess = (r && r.session) || {};
+        show("sessionMsg", "✔ نشست ذخیره شد: " + ((sess.cookies || []).length) + " کوکی"
+                          + ((sess.cookies || []).length ? " [" + (sess.cookies || []).join(", ") + "]" : ""), "info");
+        $("sessionText").value = "";
+      })
+      .catch(function (e) { show("sessionMsg", "✘ " + e.message, "err"); });
+  });
   ["symbol", "quantity", "price", "time", "side", "duration", "interval", "timeSync", "body"].forEach(function (k) {
     $(k).addEventListener("change", saveForm);
   });
+  $("bootstrapOn").addEventListener("change", saveForm);
+  $("browserOrder").addEventListener("change", saveForm);
 
   loadForm();
   $("interval").value = $("interval").value || "305";
