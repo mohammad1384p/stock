@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover
     print("کتابخانه‌ی requests نصب نیست. اجرا کنید:  pip install -r requirements.txt")
     sys.exit(1)
 
+from timesync import clock, sync as time_sync, DEFAULT_NTP_SERVERS
 from exir_auth import ensure_token, jwt_exp, load_saved_token, describe_token, clean_token
 
 try:
@@ -73,7 +74,7 @@ def log(*args) -> None:
 
 
 def now_str(tz) -> str:
-    return datetime.now(tz).strftime("%H:%M:%S.%f")[:-3]
+    return datetime.fromtimestamp(clock.now(), tz).strftime("%H:%M:%S.%f")[:-3]
 
 
 # --------------------------------------------------------------------------- #
@@ -197,7 +198,7 @@ def parse_target_time(s: str, tz, allow_tomorrow: bool) -> datetime:
     h, mi = int(m.group(1)), int(m.group(2))
     sec = int(m.group(3) or 0)
     ms = int((m.group(4) or "0").ljust(3, "0"))
-    now = datetime.now(tz)
+    now = datetime.fromtimestamp(clock.now(), tz)
     target = now.replace(hour=h, minute=mi, second=sec, microsecond=ms * 1000)
     if target < now and allow_tomorrow:
         target += timedelta(days=1)
@@ -205,9 +206,9 @@ def parse_target_time(s: str, tz, allow_tomorrow: bool) -> datetime:
 
 
 def wait_until(ts: float) -> None:
-    """صبر دقیق تا زمان epoch مشخص (sleep درشت + busy-wait در انتها)."""
+    """صبر دقیق تا زمان epoch مشخص (بر اساس ساعت همگام‌شده؛ sleep درشت + busy-wait در انتها)."""
     while True:
-        remaining = ts - time.time()
+        remaining = ts - clock.now()
         if remaining <= 0:
             return
         if remaining > 0.05:
@@ -279,9 +280,9 @@ def warmup(session: requests.Session, base: str, tz) -> None:
         msg = f"🔌 اتصال آماده شد (HTTP {r.status_code}, RTT ≈ {rtt:.0f}ms)"
         date_h = r.headers.get("Date")
         if date_h:
-            server = parsedate_to_datetime(date_h).timestamp()
-            offset = server - (t0 + t1) / 2  # دقت حدود ±۱ ثانیه (هدر Date ثانیه‌ای است)
-            msg += f" | اختلاف تقریبی ساعت سرور با سیستم: {offset:+.1f}s"
+            server = parsedate_to_datetime(date_h).timestamp() + 0.5
+            offset = server - ((t0 + t1) / 2 + clock.offset)  # دقت حدود ±۰.۵ ثانیه (هدر Date ثانیه‌ای است)
+            msg += f" | ساعت سرور کارگزاری نسبت به ساعت همگام‌شده: {offset:+.1f}s"
         log(cyan(msg))
     except Exception as e:  # noqa: BLE001
         log(yellow(f"⚠️  warm-up ناموفق بود (مشکلی نیست، ادامه می‌دهیم): {e}"))
@@ -397,6 +398,11 @@ def parse_args() -> argparse.Namespace:
                    help="آدرس کارگزاری")
     p.add_argument("--tz", default=os.environ.get("EXIR_TZ", "Asia/Tehran"),
                    help="منطقه‌ی زمانی برای تفسیر ساعت (خالی = ساعت سیستم)")
+    p.add_argument("--time-sync", choices=["auto", "ntp", "server", "off"],
+                   default=os.environ.get("EXIR_TIME_SYNC", "auto"),
+                   help="همگام‌سازی خودکار زمان: auto=اول NTP بعد ساعت سرور کارگزاری، off=ساعت سیستم")
+    p.add_argument("--ntp-server", action="append",
+                   help="سرور NTP دلخواه (قابل تکرار). پیش‌فرض: " + ", ".join(DEFAULT_NTP_SERVERS))
     p.add_argument("--timeout", type=float, default=10.0, help="timeout هر درخواست (ثانیه)")
     p.add_argument("--no-stop", action="store_true",
                    help="بعد از اولین سفارش موفق هم ارسال را ادامه بده (پیش‌فرض: توقف)")
@@ -471,15 +477,21 @@ def main() -> None:
 
     isin = resolve_isin(args.symbol, interactive)
 
+    def do_sync() -> None:
+        time_sync(args.time_sync, session=session, base_url=base,
+                  ntp_servers=args.ntp_server, log=lambda m: log(cyan(m)))
+
+    do_sync()
+
     if args.now:
-        target = datetime.now(tz) + timedelta(seconds=3)
+        target = datetime.fromtimestamp(clock.now(), tz) + timedelta(seconds=3)
     else:
         try:
             target = parse_target_time(args.time, tz, allow_tomorrow=False)
         except ValueError as e:
             log(red(str(e)))
             sys.exit(2)
-        if target.timestamp() + args.duration < time.time():
+        if target.timestamp() + args.duration < clock.now():
             log(red(f"⏰ زمان {target:%H:%M:%S} گذشته است. (برای تست فوری از --now استفاده کنید)"))
             sys.exit(2)
 
@@ -502,6 +514,8 @@ def main() -> None:
     log(f"  شروع       : {target.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} ({args.tz or 'system'})")
     log(f"  مدت/فاصله  : {args.duration:g} ثانیه / {args.interval} میلی‌ثانیه  →  {count} درخواست")
     log(f"  توقف پس از موفقیت: {'خیر' if args.no_stop else 'بله'}")
+    acc = f" ±{clock.accuracy * 1000:.0f}ms" if clock.accuracy is not None else ""
+    log(f"  ساعت مرجع  : {clock.source}{acc}  (اختلاف با سیستم {clock.offset * 1000:+.0f}ms)")
     log(f"  توکن       : {describe_token(token) if token else red('ندارد')}")
     exp = jwt_exp(token) if token else None
     if exp and exp < start_ts + args.duration:
@@ -532,19 +546,26 @@ def main() -> None:
     try:
         # warm-up حدود ۵ ثانیه قبل از شروع (یا همین الان اگر زمان کمی مانده)
         warm_ts = start_ts - 5
-        if warm_ts - time.time() > 0:
+        if warm_ts - clock.now() > 0:
             log(cyan(f"\n⏳ منتظر تا {target:%H:%M:%S} … (Ctrl+C برای لغو)"))
             last_print = 0.0
-            while time.time() < warm_ts:
-                rem = start_ts - time.time()
+            resynced = False
+            while clock.now() < warm_ts:
+                rem = start_ts - clock.now()
+                # همگام‌سازی دوباره حدود ۴۵ ثانیه قبل از شروع (جبران drift ساعت در انتظار طولانی)
+                if (not resynced and args.time_sync != "off" and rem <= 45
+                        and clock.synced_at and time.time() - clock.synced_at > 90):
+                    resynced = True
+                    print()
+                    do_sync()
                 if time.time() - last_print >= 1:
                     with _print_lock:
                         sys.stdout.write(f"\r   زمان فعلی {now_str(tz)}   |   باقی‌مانده {int(rem)//3600:02d}:{int(rem)%3600//60:02d}:{int(rem)%60:02d}   ")
                         sys.stdout.flush()
                     last_print = time.time()
-                time.sleep(min(0.2, max(0.0, warm_ts - time.time())))
+                time.sleep(min(0.2, max(0.0, warm_ts - clock.now())))
             print()
-        if time.time() < start_ts - 0.5:
+        if clock.now() < start_ts - 0.5:
             warmup(session, base, tz)
 
         # ---------- ارسال ----------
