@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import os
 import re
@@ -33,6 +32,8 @@ try:
 except ImportError:  # pragma: no cover
     print("کتابخانه‌ی requests نصب نیست. اجرا کنید:  pip install -r requirements.txt")
     sys.exit(1)
+
+from exir_auth import ensure_token, jwt_exp, load_saved_token, describe_token, clean_token
 
 try:
     from zoneinfo import ZoneInfo
@@ -234,13 +235,12 @@ def build_session(args, pool: int) -> requests.Session:
         "sec-ch-ua-mobile": "?1",
         "sec-ch-ua-platform": '"Android"',
     })
-    if args.token:
-        tok = args.token.strip()
-        if args.auth_header.lower() == "authorization" and not tok.lower().startswith(("bearer ", "basic ")):
-            tok = f"Bearer {tok}"
-        s.headers[args.auth_header] = tok
     if args.cookie:
-        s.headers["cookie"] = args.cookie.strip()
+        host = requests.utils.urlparse(base).hostname or ""
+        for part in args.cookie.split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                s.cookies.set(k.strip(), v.strip(), domain=host, path="/")
     if args.app_n:
         s.headers["x-app-n"] = args.app_n.strip()
     for h in args.header or []:
@@ -370,13 +370,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--side", choices=["buy", "sell"], default="buy", help="خرید یا فروش")
     p.add_argument("-d", "--duration", type=float, default=10.0, help="مدت ارسال (ثانیه)")
     p.add_argument("-i", "--interval", type=int, default=305, help="فاصله‌ی بین درخواست‌ها (میلی‌ثانیه)")
-    p.add_argument("--token", default=os.environ.get("EXIR_TOKEN"),
-                   help="توکن لاگین (یا متغیر محیطی EXIR_TOKEN). اگر ندهید پرسیده می‌شود")
-    p.add_argument("--auth-header", default=os.environ.get("EXIR_AUTH_HEADER", "Authorization"),
-                   help="نام هدری که توکن در آن قرار می‌گیرد")
-    p.add_argument("--cookie", default=os.environ.get("EXIR_COOKIE"),
-                   help="مقدار کامل هدر cookie (اختیاری، یا EXIR_COOKIE)")
-    p.add_argument("--app-n", default=os.environ.get("EXIR_APP_N"),
+    g = p.add_argument_group("لاگین / توکن")
+    g.add_argument("--token", default=os.environ.get("EXIR_TOKEN"),
+                   help="توکن JWT (مقدار کوکی JWT-TOKEN یا authToken). اگر ندهید از فایل ذخیره یا لاگین گرفته می‌شود")
+    g.add_argument("--login", action="store_true", help="لاگین اجباری (حتی اگر توکن ذخیره‌شده معتبر باشد)")
+    g.add_argument("--login-only", action="store_true", help="فقط لاگین کن و توکن را ذخیره کن")
+    g.add_argument("--username", default=os.environ.get("EXIR_USERNAME"), help="نام کاربری (یا EXIR_USERNAME)")
+    g.add_argument("--password", default=os.environ.get("EXIR_PASSWORD"),
+                   help="رمز عبور (یا EXIR_PASSWORD). بهتر است ندهید تا مخفی پرسیده شود")
+    g.add_argument("--otp", default=None, help="کد یکبار مصرف (در صورت فعال بودن ورود دو مرحله‌ای)")
+    g.add_argument("--captcha-url", default=os.environ.get("EXIR_CAPTCHA_URL"),
+                   help="آدرس تصویر کپچا (اگر خالی باشد چند آدرس رایج امتحان می‌شود)")
+    g.add_argument("--token-file", default=os.environ.get("EXIR_TOKEN_FILE", ".exir_token.json"),
+                   help="فایل ذخیره‌ی توکن")
+    g.add_argument("--captcha-file", default="captcha.png", help="مسیر ذخیره‌ی تصویر کپچا")
+    g.add_argument("--auth-mode", choices=["cookie", "bearer", "both"],
+                   default=os.environ.get("EXIR_AUTH_MODE", "cookie"),
+                   help="ارسال توکن به‌صورت کوکی JWT-TOKEN (مثل مرورگر)، هدر Authorization، یا هر دو")
+    g.add_argument("--cookie", default=os.environ.get("EXIR_COOKIE"),
+                   help="کوکی‌های اضافه به شکل 'a=1; b=2' (اختیاری، یا EXIR_COOKIE)")
+    g.add_argument("--app-n", default=os.environ.get("EXIR_APP_N"),
                    help="مقدار هدر x-app-n (اختیاری، یا EXIR_APP_N)")
     p.add_argument("-H", "--header", action="append",
                    help="هدر اضافه به شکل 'name: value' (قابل تکرار)")
@@ -406,10 +419,34 @@ def main() -> None:
 
     log(bold(cyan("\n═══════════  ربات سفارش Exir  ═══════════\n")))
 
+    base = args.base_url.rstrip("/")
+    session = build_session(args, pool=64)
+
+    # ---------- لاگین / توکن ----------
+    token = None
+    try:
+        if args.dry_run and not (args.login or args.login_only):
+            if args.token:
+                token = clean_token(args.token)
+            else:
+                saved = load_saved_token(Path(args.token_file), base)
+                token = saved["token"] if saved else None
+            if token:
+                from exir_auth import apply_token
+                apply_token(session, base, token, args.auth_mode)
+        else:
+            token = ensure_token(session, args, log, interactive)
+    except (EOFError, KeyboardInterrupt):
+        log(red("\nلغو شد."))
+        sys.exit(1)
+    except Exception as e:  # noqa: BLE001
+        log(red(f"✘ {e}"))
+        sys.exit(3)
+    if args.login_only:
+        return
+
     # ---------- ورودی‌ها ----------
     try:
-        if not args.token and not args.cookie and not args.dry_run:
-            args.token = getpass.getpass("توکن لاگین (نمایش داده نمی‌شود): ").strip()
         if not args.symbol:
             args.symbol = ask("نماد / نام / ISIN سهم")
         if args.quantity is None:
@@ -431,9 +468,6 @@ def main() -> None:
     if args.interval <= 0 or args.duration < 0:
         log(red("interval باید مثبت و duration نامنفی باشد."))
         sys.exit(2)
-    if not args.token and not args.cookie and not args.dry_run:
-        log(red("توکن یا کوکی لازم است."))
-        sys.exit(2)
 
     isin = resolve_isin(args.symbol, interactive)
 
@@ -454,11 +488,9 @@ def main() -> None:
     start_ts = target.timestamp()
     schedule = [start_ts + k * interval for k in range(count)]
 
-    base = args.base_url.rstrip("/")
     url = base + ORDER_PATH
     body = build_body(args, isin)
     payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
-    session = build_session(args, pool=count)
 
     # ---------- خلاصه ----------
     log(bold("خلاصه‌ی سفارش:"))
@@ -470,13 +502,23 @@ def main() -> None:
     log(f"  شروع       : {target.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} ({args.tz or 'system'})")
     log(f"  مدت/فاصله  : {args.duration:g} ثانیه / {args.interval} میلی‌ثانیه  →  {count} درخواست")
     log(f"  توقف پس از موفقیت: {'خیر' if args.no_stop else 'بله'}")
+    log(f"  توکن       : {describe_token(token) if token else red('ندارد')}")
+    exp = jwt_exp(token) if token else None
+    if exp and exp < start_ts + args.duration:
+        log(red("  ⚠️  توکن قبل از پایان زمان ارسال منقضی می‌شود! با --login دوباره وارد شوید."))
+    saved = load_saved_token(Path(args.token_file), base) or {}
+    delay = saved.get("sendOrderDelay")
+    if delay and args.interval < int(delay):
+        log(yellow(f"  ⚠️  کارگزار sendOrderDelay={delay}ms اعلام کرده؛ فاصله‌ی {args.interval}ms ممکن است خطای محدودیت بگیرد."))
     log(f"  بدنه       : {json.dumps(body, ensure_ascii=False)}")
     if args.dry_run:
         log(yellow("\n[dry-run] هیچ درخواستی ارسال نشد.\nهدرها:"))
         for k, v in session.headers.items():
-            if k.lower() in ("authorization", "cookie", args.auth_header.lower()):
-                v = v[:12] + "…" if len(v) > 12 else v
+            if k.lower() == "authorization":
+                v = v[:16] + "…"
             log(f"  {k}: {v}")
+        for c in session.cookies:
+            log(f"  cookie {c.name}={c.value[:10]}…")
         return
 
     if interactive and not args.yes:

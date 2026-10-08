@@ -3,3 +3,5 @@ __pycache__/
 venv/
 .env
 *.log
+.exir_token.json
+captcha.*
