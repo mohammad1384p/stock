@@ -57,7 +57,7 @@ from exir_auth import (CAPTCHA_TTL, apply_token, clean_token, describe_token, jw
                        session_cookies)
 from exir_bot import (DEFAULT_BASE_URL, ORDER_PATH, Stats, apply_replay, build_session,
                       parse_fetch_snippet, parse_target_time, resolve_isin, send_order,
-                      wait_until, warmup)
+                      stop_message, wait_until, warmup)
 from timesync import clock, sync as time_sync
 
 __version__ = "1.0"
@@ -606,11 +606,11 @@ def _fire(state: PanelState, cfg: SimpleNamespace, session, base: str, stop_evt:
     with ThreadPoolExecutor(max_workers=min(count, 64)) as pool:
         for k, ts in enumerate(schedule, 1):
             if stop_evt.is_set():
-                panel_log(f"✅ سفارش موفق؛ {count - k + 1} درخواست باقی‌مانده ارسال نشد.")
+                panel_log(stop_message(stats, count - k + 1))
                 break
             wait_until(ts)
             if stop_evt.is_set():
-                panel_log(f"✅ سفارش موفق؛ {count - k + 1} درخواست باقی‌مانده ارسال نشد.")
+                panel_log(stop_message(stats, count - k + 1))
                 break
             with stats.lock:
                 stats.sent += 1
@@ -621,7 +621,10 @@ def _fire(state: PanelState, cfg: SimpleNamespace, session, base: str, stop_evt:
     with stats.lock:
         sent, ok, failed = stats.sent, stats.success, stats.failed
     panel_log(f"📊 گزارش نهایی — ارسال‌شده: {sent} | موفق: {ok} | ناموفق: {failed}")
-    if stop_evt.is_set() and ok:
+    if stats.stop_reason == "security":
+        state.set_status("error", "کارگزاری درخواست را از نظر احراز هویت/امنیت رد کرد؛ "
+                         "ارسال‌های بعدی متوقف شدند. نشست و هدرهای سفارش را بررسی کنید.")
+    elif stop_evt.is_set() and ok:
         state.set_status("finished", f"سفارش موفق ثبت شد ({ok} پاسخ موفق از {sent} درخواست).")
     elif stop_evt.is_set():
         state.set_status("stopped", "اجرا متوقف شد.")
