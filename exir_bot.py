@@ -34,7 +34,8 @@ except ImportError:  # pragma: no cover
     sys.exit(1)
 
 from timesync import clock, sync as time_sync, DEFAULT_NTP_SERVERS
-from exir_auth import ensure_token, jwt_exp, load_saved_token, describe_token, clean_token
+from exir_auth import (ensure_token, jwt_exp, load_saved_token, describe_token, clean_token,
+                       security_hint)
 
 try:
     from zoneinfo import ZoneInfo
@@ -228,13 +229,19 @@ def build_session(args, pool: int) -> requests.Session:
     base = args.base_url.rstrip("/")
     s.headers.update({
         "accept": "application/json, text/plain, */*",
+        "accept-language": "en-US,en;q=0.9,fa;q=0.8",
         "content-type": "application/json",
         "origin": base,
         "referer": f"{base}/new-exir/market-view",
         "user-agent": USER_AGENT,
+        "pragma": "no-cache",
+        "cache-control": "no-cache",
         "sec-ch-ua": '"Chromium";v="154", "Google Chrome";v="154", "Not A(Brand";v="99"',
         "sec-ch-ua-mobile": "?1",
         "sec-ch-ua-platform": '"Android"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
     })
     if args.cookie:
         host = requests.utils.urlparse(base).hostname or ""
@@ -268,6 +275,96 @@ def build_body(args, isin: str) -> dict:
         "dividedOrder": False,
         "etfTypeCode": None,
     }
+
+
+# --------------------------------------------------------------------------- #
+#  بازپخش درخواست مرورگر (Copy as fetch) — برای پیدا کردن علت خطای ۴۲۲
+# --------------------------------------------------------------------------- #
+# هدرهایی که نباید دستی ست شوند (خودِ requests/سرور تعیین می‌کند)
+_HOP_HEADERS = {"content-length", "host", "connection", "cookie", "accept-encoding",
+                "transfer-encoding", "content-encoding"}
+
+
+def _js_string(lit: str) -> str:
+    """رشته‌ی جاوااسکریپتی ("..." یا '...') را به متن تبدیل می‌کند."""
+    q = lit[0]
+    body = lit[1:-1]
+    if q == '"':
+        try:
+            return json.loads(lit)
+        except ValueError:
+            pass
+    return (body.replace("\\" + q, q).replace("\\n", "\n").replace("\\t", "\t")
+            .replace('\\"', '"').replace("\\'", "'").replace("\\\\", "\\"))
+
+
+def parse_fetch_snippet(text: str) -> dict:
+    """
+    از خروجی «Copy as fetch» کروم (DevTools ← Request ← Copy → Copy as fetch)
+    هدرها و بدنه را بیرون می‌کشد: {"headers": {...}, "body": "<متن JSON>"} .
+    """
+    out: dict = {"headers": {}, "body": None}
+    try:  # شاید مستقیم JSON خالص باشد
+        json.loads(text)
+        out["body"] = text
+        return out
+    except ValueError:
+        pass
+    m = re.search(r"[\"']?body[\"']?\s*:\s*(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')", text, re.S)
+    if m:
+        out["body"] = _js_string(m.group(1))
+
+    m = re.search(r"[\"']?headers[\"']?\s*:\s*\{", text)
+    block = ""
+    if m:
+        # بلاک هدرها را با شمارش آکولاد جدا می‌کنیم (مقدارها ممکن است } داشته باشند)
+        start = m.end() - 1
+        depth = 0
+        for j in range(start, len(text)):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    block = text[start + 1:j]
+                    break
+    for k, v in re.findall(r"[\"']([^\"']+)[\"']\s*:\s*(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')", block):
+        out["headers"][k.strip().lower()] = _js_string(v)
+    return out
+
+
+def apply_replay(session: requests.Session, headers: dict, log) -> None:
+    """هدرهای خروجی Copy as fetch را روی session می‌گذارد (کوکی‌ها merge می‌شوند)."""
+    for k, v in headers.items():
+        if k in _HOP_HEADERS:
+            if k == "cookie":
+                host = requests.utils.urlparse(session.headers.get("origin", "")).hostname or ""
+                for part in v.split(";"):
+                    if "=" in part:
+                        ck, cv = part.split("=", 1)
+                        session.cookies.set(ck.strip(), cv.strip(), domain=host, path="/")
+            continue
+        session.headers[k] = v
+    if session.headers.get("x-app-n"):
+        log(f"🧩 هدرهای مرورگر اعمال شد (x-app-n = {session.headers['x-app-n']})")
+
+
+def order_hint(status: int, data) -> str:
+    """توضیح خطاهای رایج ثبت سفارش."""
+    hint = security_hint(status, data)
+    if hint:
+        return hint
+    if status != 422:
+        return ""
+    return (
+        "ℹ️  ۴۲۲ یعنی «امنیت اوکی است، ولی بدنه‌ی سفارش از نظر اعتبارسنجی رد شد».\n"
+        "    فیلد خطادار را در همین پاسخ سرور ببینید (کلیدهای errors/description). دلایل رایج:\n"
+        "    قیمت خارج از دامنه‌ی مجاز روز (±۵٪ دامنه/توقف) یا غیرمضرب در گام قیمت،\n"
+        "    تعداد بیش از حد مجاز (سقف حجم هر سفارش)، نماد در حال توقف/عدم امکان سفارش،\n"
+        "    یا بسته بودن سمت سفارش (مثلاً صف/دامنه در آن لحظه).\n"
+        "    برای فرستادن دقیقاً همان بدنه‌ی مرورگر: DevTools ← Request ← Copy as fetch،\n"
+        "    ذخیره در فایل و اجرا با  --body-file <فایل>  (هدرها و بدنه هر دو اعمال می‌شوند)."
+    )
 
 
 def warmup(session: requests.Session, base: str, tz) -> None:
@@ -335,7 +432,12 @@ def send_order(idx: int, session: requests.Session, url: str, payload: bytes,
             stats.failed += (not ok)
             stats.results.append((idx, sent_at, r.status_code, desc))
         head = f"#{idx:02d}  ارسال {sent_at}  ←  دریافت {now_str(tz)}  ({ms:.0f}ms)  HTTP {r.status_code}"
-        log((green("✔ " + head) if ok else red("✘ " + head)) + "\n" + body + "\n" + "─" * 60)
+        extra = ""
+        if not ok:
+            hint = order_hint(r.status_code, data if data is not None else body)
+            if hint:
+                extra = "\n" + yellow(hint)
+        log((green("✔ " + head) if ok else red("✘ " + head)) + "\n" + body + extra + "\n" + "─" * 60)
         if ok and stop_on_success:
             stop_evt.set()
     except Exception as e:  # noqa: BLE001
@@ -385,6 +487,13 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--token-file", default=os.environ.get("EXIR_TOKEN_FILE", ".exir_token.json"),
                    help="فایل ذخیره‌ی توکن")
     g.add_argument("--captcha-file", default="captcha.jpg", help="مسیر ذخیره‌ی تصویر کپچا (پسوند خودکار تنظیم می‌شود)")
+    g.add_argument("--captcha-web", nargs="?", const="auto", metavar="PORT",
+                   default=os.environ.get("EXIR_CAPTCHA_WEB"),
+                   help="تصویر کپچا را در مرورگر نشان بده و کد را از آن‌جا بگیر "
+                        "(پیش‌فرض: auto=روشن؛ عدد بدهید تا روی همان پورت بالا بیاید، off=خاموش)")
+    g.add_argument("--captcha-web-host", default=os.environ.get("EXIR_CAPTCHA_WEB_HOST", "0.0.0.0"),
+                   metavar="HOST",
+                   help="آدرسی که وب‌سرور کپچا روی آن گوش می‌دهد (127.0.0.1 = فقط خود سرور)")
     g.add_argument("--auth-mode", choices=["cookie", "bearer", "both"],
                    default=os.environ.get("EXIR_AUTH_MODE", "cookie"),
                    help="ارسال توکن به‌صورت کوکی JWT-TOKEN (مثل مرورگر)، هدر Authorization، یا هر دو")
@@ -403,6 +512,11 @@ def parse_args() -> argparse.Namespace:
                    help="همگام‌سازی خودکار زمان: auto=اول NTP بعد ساعت سرور کارگزاری، off=ساعت سیستم")
     p.add_argument("--ntp-server", action="append",
                    help="سرور NTP دلخواه (قابل تکرار). پیش‌فرض: " + ", ".join(DEFAULT_NTP_SERVERS))
+    p.add_argument("--body-json", metavar="JSON",
+                   help="بدنه‌ی سفارش را عیناً همین JSON بفرست (برای بازپخش درخواست مرورگر)")
+    p.add_argument("--body-file", metavar="FILE",
+                   help="فایل حاوی بدنه‌ی JSON سفارش، یا خروجی «Copy as fetch» کروم "
+                        "(هدرها و بدنه هر دو اعمال می‌شوند) — برای رفع خطای ۴۲۲")
     p.add_argument("--timeout", type=float, default=10.0, help="timeout هر درخواست (ثانیه)")
     p.add_argument("--no-stop", action="store_true",
                    help="بعد از اولین سفارش موفق هم ارسال را ادامه بده (پیش‌فرض: توقف)")
@@ -451,14 +565,42 @@ def main() -> None:
     if args.login_only:
         return
 
+    # ---------- بدنه: پیش‌فرض ربات یا بازپخش درخواست مرورگر ----------
+    replay_text: str | None = None
+    if args.body_json:
+        replay_text = args.body_json
+    elif args.body_file:
+        raw = Path(args.body_file).read_text(encoding="utf-8")
+        snippet = parse_fetch_snippet(raw)   # JSON خالص یا خروجی «Copy as fetch»
+        replay_text = snippet["body"]
+        if snippet["headers"]:
+            apply_replay(session, snippet["headers"], log)
+        if not replay_text:
+            log(red("✘ در فایل بدنه‌ی سفارشی، JSON یا بدنه‌ی Copy as fetch پیدا نشد."))
+            sys.exit(2)
+    replay_body: dict | None = None
+    if replay_text:
+        try:
+            replay_body = json.loads(replay_text)
+        except ValueError:
+            log(red("✘ بدنه‌ی سفارشی JSON معتبر نیست."))
+            sys.exit(2)
+        if not isinstance(replay_body, dict):
+            log(red("✘ بدنه‌ی سفارشی باید یک آبجکت JSON باشد."))
+            sys.exit(2)
+        log(yellow("🧩 بدنه‌ی سفارش از درخواست مرورگر بازپخش می‌شود (بدون بازسازی فیلدها)."))
+
     # ---------- ورودی‌ها ----------
     try:
         if not args.symbol:
-            args.symbol = ask("نماد / نام / ISIN سهم")
+            args.symbol = (str(replay_body["insMaxLcode"]) if replay_body and replay_body.get("insMaxLcode")
+                           else ask("نماد / نام / ISIN سهم"))
         if args.quantity is None:
-            args.quantity = int(ask("تعداد"))
+            args.quantity = (int(replay_body["quantity"]) if replay_body and replay_body.get("quantity") is not None
+                             else int(ask("تعداد")))
         if args.price is None:
-            args.price = int(ask("قیمت (ریال)"))
+            args.price = (int(replay_body["price"]) if replay_body and replay_body.get("price") is not None
+                          else int(ask("قیمت (ریال)")))
         if not args.time and not args.now:
             args.time = ask("ساعت شروع (HH:MM:SS)")
     except (EOFError, KeyboardInterrupt):
@@ -501,8 +643,12 @@ def main() -> None:
     schedule = [start_ts + k * interval for k in range(count)]
 
     url = base + ORDER_PATH
-    body = build_body(args, isin)
-    payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    if replay_body is not None:
+        body = replay_body
+        payload = replay_text.encode("utf-8")   # عیناً همان بایت‌های مرورگر
+    else:
+        body = build_body(args, isin)
+        payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
 
     # ---------- خلاصه ----------
     log(bold("خلاصه‌ی سفارش:"))
