@@ -30,16 +30,17 @@ from urllib.parse import urlparse
 import requests
 
 LOGIN_PATH = "/api/v2/login"
-# آدرس دقیق کپچا در درخواست‌های ارسالی مشخص نبود؛ این‌ها به ترتیب امتحان می‌شوند.
-# اگر هیچ‌کدام کار نکرد، آدرس درست را با --captcha-url بدهید.
+# GET /captcha → image/jpeg + کوکی client_login_id (اعتبار ۱۲۰ ثانیه)
+# بقیه فقط به‌عنوان جایگزین امتحان می‌شوند. آدرس دلخواه را با --captcha-url بدهید.
+CAPTCHA_TTL = 120
 CAPTCHA_CANDIDATES = (
+    "/captcha",
     "/api/v2/captcha",
     "/api/v1/captcha",
     "/api/v2/login/captcha",
     "/api/v1/login/captcha",
     "/api/v2/captcha/image",
     "/api/v1/captcha/image",
-    "/captcha",
 )
 TOKEN_COOKIE = "JWT-TOKEN"
 
@@ -166,8 +167,8 @@ def fetch_captcha(session: requests.Session, base: str, captcha_url: str | None,
         if not u.startswith("http"):
             u = base + (u if u.startswith("/") else "/" + u)
         try:
-            r = session.get(u, params={"t": int(time.time() * 1000)}, timeout=10,
-                            headers={"accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8, application/json",
+            r = session.get(u, timeout=10,
+                            headers={"accept": "application/json, text/plain, */*",
                                      "referer": f"{base}/new-exir/login"})
         except Exception as e:  # noqa: BLE001
             last_err = str(e)
@@ -175,6 +176,11 @@ def fetch_captcha(session: requests.Session, base: str, captcha_url: str | None,
         if r.status_code == 200:
             img = _extract_image(r)
             if img:
+                # اگر کوکی به هر دلیلی در jar ننشست، از هدر client_login_id بردار
+                cid = r.headers.get("client_login_id")
+                if cid and not session.cookies.get("client_login_id"):
+                    session.cookies.set("client_login_id", cid,
+                                        domain=urlparse(base).hostname or "", path="/")
                 return img
         last_err = f"{u} → HTTP {r.status_code}"
     raise RuntimeError(
@@ -247,9 +253,17 @@ def login(session: requests.Session, base: str, username: str, password: str, *,
     """لاگین تعاملی. خروجی: دیکشنری پاسخ سرور (شامل authToken)."""
     url = base + LOGIN_PATH
     for attempt in range(1, max_tries + 1):
-        img = fetch_captcha(session, base, captcha_url, log)
-        show_captcha(img, captcha_path, log)
-        captcha = input("کد کپچا را وارد کنید: ").strip()
+        while True:
+            img = fetch_captcha(session, base, captcha_url, log)
+            t_captcha = time.time()
+            show_captcha(img, captcha_path, log)
+            captcha = input(f"کد کپچا را وارد کنید (حداکثر {CAPTCHA_TTL} ثانیه، Enter خالی = کپچای جدید): ").strip()
+            if not captcha:
+                continue
+            if time.time() - t_captcha > CAPTCHA_TTL - 3:
+                log("⌛ کپچا منقضی شد (۱۲۰ ثانیه)؛ کپچای جدید گرفته می‌شود.")
+                continue
+            break
         body = {"username": username, "password": password, "captcha": captcha, "otp": otp or ""}
         headers = {
             "accept": "application/json",

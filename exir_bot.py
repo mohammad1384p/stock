@@ -380,10 +380,10 @@ def parse_args() -> argparse.Namespace:
                    help="رمز عبور (یا EXIR_PASSWORD). بهتر است ندهید تا مخفی پرسیده شود")
     g.add_argument("--otp", default=None, help="کد یکبار مصرف (در صورت فعال بودن ورود دو مرحله‌ای)")
     g.add_argument("--captcha-url", default=os.environ.get("EXIR_CAPTCHA_URL"),
-                   help="آدرس تصویر کپچا (اگر خالی باشد چند آدرس رایج امتحان می‌شود)")
+                   help="آدرس تصویر کپچا (پیش‌فرض /captcha)")
     g.add_argument("--token-file", default=os.environ.get("EXIR_TOKEN_FILE", ".exir_token.json"),
                    help="فایل ذخیره‌ی توکن")
-    g.add_argument("--captcha-file", default="captcha.png", help="مسیر ذخیره‌ی تصویر کپچا")
+    g.add_argument("--captcha-file", default="captcha.jpg", help="مسیر ذخیره‌ی تصویر کپچا (پسوند خودکار تنظیم می‌شود)")
     g.add_argument("--auth-mode", choices=["cookie", "bearer", "both"],
                    default=os.environ.get("EXIR_AUTH_MODE", "cookie"),
                    help="ارسال توکن به‌صورت کوکی JWT-TOKEN (مثل مرورگر)، هدر Authorization، یا هر دو")
