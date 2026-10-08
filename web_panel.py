@@ -12,8 +12,9 @@
   * ارسال را شروع/متوقف کنید و پاسخ هر درخواست را زنده ببینید.
 
 نمونه:
-    python web_panel.py --host 127.0.0.1 --port 2345
-    python web_panel.py --port 8000 --time-sync off          # برای تست سریع
+    python web_panel.py                                   # پیش‌فرض: 0.0.0.0:2345
+    python web_panel.py --host 127.0.0.1                  # فقط روی خود سرور، پورت 2345
+    python web_panel.py --port 2345 --time-sync off        # بدون همگام‌سازی ساعت (تست)
 
 امنیت: پنل می‌تواند سفارش واقعی بفرستد و توکن/رمز را در خود دارد؛ پیش‌فرض روی
 ``0.0.0.0`` بالا می‌آید تا از مرورگر همان شبکه/تونل SSH در دسترس باشد. اگر لازم
@@ -1399,7 +1400,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument("--host", default=os.environ.get("EXIR_PANEL_HOST", "0.0.0.0"),
                    help="آدرس بایند وب‌سرور پنل (127.0.0.1 = فقط خود سرور)")
-    p.add_argument("--port", type=int, default=int(os.environ.get("EXIR_PANEL_PORT", "8000")),
+    p.add_argument("--port", type=int, default=int(os.environ.get("EXIR_PANEL_PORT", "2345")),
                    help="پورت وب‌سرور پنل (0 = پورت آزاد تصادفی)")
     p.add_argument("--base-url", default=os.environ.get("EXIR_BASE_URL", DEFAULT_BASE_URL),
                    help="آدرس کارگزاری")

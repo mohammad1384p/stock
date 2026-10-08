@@ -56,10 +56,11 @@ python exir_bot.py -s وتوصا -q 10 -p 6700 -t 08:45:00 --app-n "201888774774
 اگر می‌خواهید همه‌چیز از مرورگر انجام شود (فرم سفارش، لاگین/کپچا، شروع و توقف، لاگ زنده):
 
 ```bash
-python web_panel.py                                   # پیش‌فرض: 0.0.0.0:8000
-python web_panel.py --host 127.0.0.1 --port 2345      # فقط روی خود سرور
-python web_panel.py --port 2345 --time-sync off       # بدون همگام‌سازی ساعت (برای تست)
+python web_panel.py                                    # پیش‌فرض: 0.0.0.0:2345
+python web_panel.py --host 127.0.0.1                   # فقط روی خود سرور (پورت 2345)
+python web_panel.py --port 2345 --time-sync off        # بدون همگام‌سازی ساعت (برای تست)
 python web_panel.py --port 2345 --token "<JWT>" --app-n "2018887747744.29964494"
+python web_panel.py --port 9000                        # اگر 2345 اشغال بود
 ```
 
 آدرس چاپ‌شده در ترمینال را در مرورگر باز کنید؛ اگر سرور از راه دور است:
