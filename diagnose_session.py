@@ -39,7 +39,8 @@ def session_report(args) -> dict:
     if saved and not saved.get("cookies"):
         warnings.append("Saved session has no companion cookies; a fresh login may be needed.")
     if re.fullmatch(r"NaN\.\d+", app_n):
-        warnings.append("x-app-n uses the fallback NaN pattern; compare its shape with the broker browser request.")
+        warnings.append("x-app-n uses the fallback NaN pattern; compare its shape with the broker browser request "
+                        "(or probe it: python probe_order.py --app-n-candidate <browser value> --yes).")
     if not app_n:
         warnings.append("x-app-n is missing.")
     if "Cookie" in session.headers:
@@ -56,6 +57,8 @@ def session_report(args) -> dict:
         "broker_send_order_delay_ms": (saved.get("sendOrderDelay")
                                        if saved and isinstance(saved.get("sendOrderDelay"), (int, float))
                                        else None),
+        "clientid": {"present": "clientid" in {k.lower() for k in prepared.headers},
+                     "empty": prepared.headers.get("clientid", None) == ""},
         "x_app_n": {"present": bool(app_n), "length": len(app_n),
                     "fallback_nan_pattern": bool(re.fullmatch(r"NaN\.\d+", app_n)),
                     "matches_saved": bool(saved and app_n and app_n == saved.get("appN"))},
@@ -78,8 +81,9 @@ def main(argv=None) -> int:
     p.add_argument("--base-url", default=os.environ.get("EXIR_BASE_URL", DEFAULT_BASE_URL))
     p.add_argument("--token-file", default=os.environ.get("EXIR_TOKEN_FILE", ".exir_token.json"))
     p.add_argument("--app-n", default=os.environ.get("EXIR_APP_N"))
-    p.add_argument("--cookie", default=os.environ.get("EXIR_COOKIE"))
+    p.add_argument("--clientid", default=os.environ.get("EXIR_CLIENTID"))
     p.add_argument("-H", "--header", action="append", default=[])
+    p.add_argument("--cookie", default=os.environ.get("EXIR_COOKIE"))
     p.add_argument("--auth-mode", choices=["cookie", "bearer", "both"], default="cookie")
     args = p.parse_args(argv)
     print(json.dumps(session_report(args), ensure_ascii=False, indent=2))

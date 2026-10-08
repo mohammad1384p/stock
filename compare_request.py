@@ -174,7 +174,8 @@ def parse_browser_input(text: str) -> dict:
 def bot_request(args) -> tuple[dict, list[str], dict | None, list[tuple[str, str]]]:
     """هدرها/نام کوکی‌ها/بدنه/جفت‌های کوکی که ربات می‌فرستد."""
     ns = argparse.Namespace(base_url=args.base_url, cookie=args.cookie,
-                            app_n=args.app_n, header=args.header or [])
+                            app_n=args.app_n, clientid=getattr(args, "clientid", None),
+                            header=args.header or [])
     session = build_session(ns, pool=16)
 
     token = args.token
@@ -326,6 +327,8 @@ def main() -> None:
     g.add_argument("--side", choices=["buy", "sell"], default="buy")
     p.add_argument("--base-url", default="https://khobregan.exirbroker.com")
     p.add_argument("--app-n", dest="app_n", help="مقدار x-app-n که ربات می‌فرستد")
+    p.add_argument("--clientid", default=os.environ.get("EXIR_CLIENTID"),
+                   help="مقدار هدر clientid ربات (پیش‌فرض: خالی، «off» = نفرست)")
     p.add_argument("--cookie", help="کوکی‌های اضافه‌ی ربات: 'a=1; b=2'")
     p.add_argument("-H", "--header", action="append", help="هدر اضافه‌ی ربات: 'name: value'")
     p.add_argument("--token", help="توکن JWT ربات (برای مقایسه‌ی کوکی JWT-TOKEN)")
