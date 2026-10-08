@@ -114,6 +114,37 @@ def save_token(path: Path, base: str, token: str, extra: dict | None = None) -> 
         pass
 
 
+def session_cookies(session: requests.Session, base: str) -> list[dict]:
+    """Keep broker cookies with their scope/expiry, never unrelated domains."""
+    host = urlparse(base).hostname or ""
+    return [
+        {"name": c.name, "value": c.value, "domain": c.domain,
+         "path": c.path, "secure": c.secure, "expires": c.expires,
+         "rest": dict(c._rest)}
+        for c in session.cookies
+        if c.domain.lstrip(".") == host and not c.is_expired()
+        and c.name != TOKEN_COOKIE
+    ]
+
+
+def restore_session_cookies(session: requests.Session, base: str, cookies) -> None:
+    host = urlparse(base).hostname or ""
+    for item in cookies if isinstance(cookies, list) else []:
+        try:
+            cookie = requests.cookies.create_cookie(**item)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if cookie.domain.lstrip(".") != host or cookie.is_expired():
+            continue
+        if cookie.name == TOKEN_COOKIE:
+            continue
+        # Explicit --cookie values take precedence over saved values.
+        if any(c.name == cookie.name and c.domain == cookie.domain
+               and c.path == cookie.path for c in session.cookies):
+            continue
+        session.cookies.set_cookie(cookie)
+
+
 def apply_token(session: requests.Session, base: str, token: str, mode: str) -> None:
     """قرار دادن توکن روی session: به‌صورت کوکی JWT-TOKEN و/یا هدر Authorization."""
     host = urlparse(base).hostname or ""
@@ -259,7 +290,8 @@ def security_hint(status: int, data) -> str:
     if "9009" not in blob and "امنیت" not in blob:
         return ""
     return (
-        "ℹ️  خطای ۹۰۰۹ یعنی کد کپچا/کوکی client_login_id با درخواست نمی‌خواند.\n"
+        "ℹ️  خطای ۹۰۰۹ یعنی درخواست از نظر امنیتی رد شده؛ علت دقیق از این کد مشخص نیست.\n"
+        "    توکن، کوکی‌های نشست، هدرها یا کپچا را بررسی کنید؛ با --login ورود تازه انجام دهید.\n"
         "    اگر تصویر کپچا را در مرورگر خودتان مستقیماً از کارگزاری باز کرده‌اید، آن تصویر به\n"
         "    نشستِ مرورگر شما گره خورده و برای لاگین از سرور معتبر نیست. تصویر باید با همان نشست\n"
         "    سرور گرفته شود (پیش‌فرض همین است) و فقط کد آن به سرور برسد — با --captcha-web لینکش را بگیرید."
@@ -272,7 +304,8 @@ def login(session: requests.Session, base: str, username: str, password: str, *,
           max_tries: int = 3) -> dict:
     """لاگین تعاملی. خروجی: دیکشنری پاسخ سرور (شامل authToken)."""
     url = base + LOGIN_PATH
-    app_n = (app_n or "").strip() or f"NaN.{random.randint(10_000_000, 99_999_999)}"
+    app_n = (app_n or session.headers.get("x-app-n") or "").strip() or f"NaN.{random.randint(10_000_000, 99_999_999)}"
+    session.headers["x-app-n"] = app_n
     for attempt in range(1, max_tries + 1):
         while True:
             img = fetch_captcha(session, base, captcha_url, log)
@@ -296,7 +329,7 @@ def login(session: requests.Session, base: str, username: str, password: str, *,
             portal.set_state("submitting", "کد دریافت شد؛ در حال لاگین با نشست سرور…")
         body = {"username": username, "password": password, "captcha": captcha, "otp": otp or ""}
         headers = {
-            "accept": "application/json",
+            "accept": "application/json, text/plain, */*",
             "referer": f"{base}/new-exir/login",
             "clientid": "",
             "x-app-n": app_n,
@@ -337,7 +370,7 @@ def ensure_token(session: requests.Session, args, log, interactive: bool) -> str
     token_file = Path(args.token_file)
 
     token: str | None = None
-    app_n: str | None = (getattr(args, "app_n", None) or "").strip() or None
+    app_n: str | None = (getattr(args, "app_n", None) or session.headers.get("x-app-n") or "").strip() or None
     if args.token and not args.login:
         token = clean_token(args.token)
         log(f"🔑 استفاده از توکن داده‌شده ({describe_token(token)})")
@@ -345,6 +378,7 @@ def ensure_token(session: requests.Session, args, log, interactive: bool) -> str
         saved = load_saved_token(token_file, base)
         if saved:
             token = saved["token"]
+            restore_session_cookies(session, base, saved.get("cookies", []))
             if not app_n and saved.get("appN"):
                 app_n = saved["appN"]  # همان x-app-nِ لاگین را برای سفارش‌ها هم بفرست
             log(f"🔑 استفاده از توکن ذخیره‌شده در {token_file} ({describe_token(token)})")
@@ -380,10 +414,11 @@ def ensure_token(session: requests.Session, args, log, interactive: bool) -> str
         if data.get("sendOrderDelay"):
             log(f"ℹ️  sendOrderDelay کارگزار: {data['sendOrderDelay']}ms")
         save_token(token_file, base, token,
-                   {"name": name, "sendOrderDelay": data.get("sendOrderDelay"), "appN": app_n})
+                   {"name": name, "sendOrderDelay": data.get("sendOrderDelay"), "appN": app_n,
+                    "cookies": session_cookies(session, base)})
         log(f"💾 توکن در {token_file} ذخیره شد (دفعه‌ی بعد تا زمان انقضا نیازی به لاگین نیست).")
 
     apply_token(session, base, token, args.auth_mode)
-    if app_n and not getattr(args, "app_n", None):
+    if app_n:
         session.headers["x-app-n"] = app_n  # ثبات x-app-n بین لاگین و سفارش‌ها
     return token
